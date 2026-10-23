@@ -1,8 +1,8 @@
 {
   "recorded": "2026-10-23",
   "version": "0.1.0.0",
-  "git_commit": "f7f9692",
-  "flash 读吞吐（KiB/s）": 36517,
+  "git_commit": "996282f",
+  "flash 读吞吐（KiB/s）": 36211,
   "文件系统挂载（ms）": 1,
   "SDRAM 全片自检（ms）": 143,
   "栈余量（%）": 89,
