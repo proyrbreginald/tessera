@@ -1,0 +1,17 @@
+[package]
+name = "simulator"
+description = "主机侧仿真替身与场景驱动：MockBus / ManualClock / MemMedium / CapturingLog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+primitives.workspace = true
+ports.workspace = true
+wire-format.workspace = true
+heapless.workspace = true
+
+[lints]
+workspace = true

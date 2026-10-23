@@ -1,0 +1,13 @@
+[package]
+name = "fault-decode"
+description = "复位原因与故障现场的解码（纯逻辑，主机可测）：SRC_SRSR / CFSR / HFSR / 硬件入栈帧 / 崩溃记录"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

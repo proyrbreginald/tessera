@@ -1,0 +1,310 @@
+# unsafe 站点预算
+#
+# 计数口径（由 `cargo xtask check-unsafe` 实现）：
+#   - `unsafe { .. }` 块：每处必须紧邻一条 `// SAFETY:`
+#   - `unsafe fn`：每个必须在文档里有 `# Safety` 段（义务转移给调用者）
+#   文档注释里的示例文本不计入。
+#
+# 规则：本文件是**上限**，只允许减少或经显式批准增加。新增 unsafe 必须在提交信息里
+# 说明：① 为什么无法避免；② 为什么这处不会引入 UB。
+#
+# 2026-10-13 批准新增 1 处（board-support/src/flexcan.rs，`ccm::enable_can2` —— 打开 CAN2 的时钟门控），理由：
+#   ① **无法避免** —— 打开 CCM 的模块门控必须写 CCM 寄存器；`imxrt-ral` 的
+#      `CCM::instance()` 取实例本身就是 `unsafe`（外设寄存器的别名规则）；
+#   ② **不会引入 UB** —— 用官方宏 `modify_reg!(CCGR0, CG9: 0b11)` 做读-改-写，
+#      只动 CG9 这两个位，不碰 CCGR0 里其它外设的门控、也绝不碰其它 CCM 寄存器；
+#      实例唯一性由调用时机保证（只在启动阶段调用一次，见 `loopback_selftest`）；
+#   ③ **门控位置有两个独立来源**：现场固件 `MIMXRT1021.h:5351`（`CCM_CCGR0_CG9_SHIFT (18U)`）
+#      与 `imxrt-ral` 的 `CG9.offset = 18`，逐位一致；它不是猜出来的；
+#   ④ 写完**立刻读回校验**（SEMC 那次 CCM 写入被静默丢弃过），读不回即报错。
+
+# 2026-10-13 批准新增 1 处（board-support/src/flexcan.rs，`write` —— FlexCAN2 写序列），理由：
+#   ① **无法避免** —— 同 `read`：直访路线需要裸地址 + `write_volatile`；
+#      写序列（清 HALT、配 CTRL1 位时序、配邮箱 CODE/ID/DATA）每一步都是寄存器写；
+#   ② **不会引入 UB** —— 地址与偏移全部来自 `[RM 表 3-x]` 与 `[RM 40.9]`/`[RM 40.5]`；
+#      `write_volatile` 正是寄存器语义；只写 FlexCAN 自己的 16 KB 窗口，不越界；
+#   ③ 调用点的前置条件写进了每个写函数的文档（例如 `CTRL1` **只能在 Freeze 模式写** ——
+#      `[RM 40.9.2]` 原文 "blocked by hardware in other modes"），并由
+#      `loopback_selftest` 的步骤顺序保证（先等 `FRZ_ACK`，再写 `CTRL1`）。
+
+# 2026-10-13 批准新增 1 处（board-support/src/flexcan.rs，FlexCAN2 只读探针），理由：
+#   ① **无法避免** —— 这颗芯片在 `imxrt-ral 0.6.2` 里虽然有 flexcan 块，但本模块
+#      刻意走"基址 + 逐条抄来的偏移"的直访路线（与 `flexspi_ip` 同一手法），
+#      因为需要**只用一次读**就把 `MCR`（含复位值 0x5980_000F）回读出来并与手册对账；
+#      用 ral 的字段 API 反而看不出"原始值对不对"（铁律 3：报事实，不报意图）；
+#   ② **不会引入 UB** —— 地址是 `[RM 表 3-x AIPS-4]` 的 FlexCAN2 基址 `0x401D_4000`
+#      加 `[RM 40.9]` 逐行抄来的偏移；`read_volatile` 正是寄存器语义（防优化、防重排）；
+#      4 字节对齐由基址与偏移共同保证；
+#   ③ **本模块没有任何写路径** —— 这一处是全模块唯一的 unsafe，且只读，
+#      因此它不可能改变器件或模块状态（探针的价值正来自这一点）。
+#   ⚠️ 注意基址**不是** 0x401D_0000（那是 FlexCAN1）；本板总线按原理图接的是 CAN2。
+
+# 2026-10-13 批准新增 1 处（board-support/src/cache.rs，`SCB.DCIMVAC` 按范围失效 D-Cache），理由：
+#   ① **无法避免** —— 已在 registry 源码里核实：`cortex-m 0.7.9` 与 `imxrt-hal 0.6`
+#      **都没有** D-Cache 维护 API（`invalidate_dcache`/`clean_dcache`/`DCIMVAC` 均无结果）；
+#      而 XIP 映射区可缓存，器件内容一改缓存里的旧行就是脏的；
+#   ② **不会引入 UB** —— `DCIMVAC`（`0xE000_EF5C`）是 ARMv7-M **架构**寄存器
+#      （ARMv7-M ARM 的 SCB 摘要表），不是外设寄存器；写它只失效该 MVA 所在 cache line，
+#      不改内存、不改外设；MVA 由 `usize -> u32` 的**检查式**转换得到（失败即返回，不截断）；
+#      循环按行递增且有界；asm 标了 `nostack, preserves_flags`。
+#   ③ 真机判据（决定性对照）——把 `MPU_AND_CACHE_ENABLED` 置 false（D-Cache 关）后
+#      两条自证全部 PASS（跨页 `bad=0`、页对齐 `detail=0`）⇒ 写入路径本身正确，
+#      唯一障碍是缓存一致性；补上本处之后在 **D-Cache 开启**下两条自证同样 PASS。
+#   ⚠️ ROM 的 `clear_cache` **不够**：SDK 里它是 `flexspi_clear_cache` → `flexspi_swreset`，
+#      清的是控制器侧 AHB RX 缓冲/预取（勘误 ERR011207 的那一半），**不是** CM7 的 L1 D-Cache。
+#      两者都要做，各自负责不同的失效对象。
+
+# 2026-10-12 再批准新增 2 处（board-support/src/flexspi_ip.rs，寄存器读/写），理由：
+#   ① 无法避免 —— 这颗芯片在 imxrt-ral 0.6.2 里**没有 FlexSPI 块**，寄存器访问只能裸地址 + volatile；
+#   ② 不会引入 UB —— 地址是 CMSIS 头定义的固定基址（`FLEXSPI_BASE = 0x402A_8000`）加照抄的字段偏移，
+#      读写都是 4 字节对齐的 u32 寄存器；`read_volatile`/`write_volatile` 正是寄存器语义
+#      （防止优化掉读、保证写真的落下去）。**真机已验证**：只读探针一次通过
+#      （`intr=ok status=0x00`）。
+#
+# 2026-10-12 再批准新增 1 处（board-support/src/rom_flash.rs，`init_once`），理由：
+#   ① 无法避免 —— ROM 的 NOR 驱动初始化同样是裸函数指针（SDK 的用法是 init → erase/program，
+#      我先前漏了 init，补上后症状不变，但它本来就必须在）；
+#   ② 不会引入 UB —— 参数是本板唯一的 FlexSPI 实例号 + 一块 **RAM 里的**配置缓冲
+#      （ROM 会把它当运行期状态写，因此绝不能指向 Flash —— 这一点也是自证抓出来的）。
+#
+# 2026-10-12 再批准新增 1 处（board-support/src/rom_flash.rs，`clear_cache`），理由：
+#   ① 无法避免 —— ROM 的 NOR 驱动接口里，缓存维护也是一个裸函数指针；
+#   ② 不会引入 UB —— 它只做缓存维护（清/失效），参数是本板唯一的 FlexSPI 实例号，
+#      不改我们拥有的任何内存结构。**这处不是可选的**：XIP 可缓存 ⇒ 不做缓存维护时，
+#      介质层的"读-改-写"会把陈旧内容整页写回器件（真机自证抓出来的）。
+#
+# 2026-10-12 批准新增 3 处（board-support/src/rom_flash.rs），理由：
+#   ① 无法避免 —— Flash 擦写走 **Boot ROM API**：ROM 的驱动表是**裸函数指针**
+#      （`g_bootloaderTree` → `flexSpiNorDriver` → `erase`/`program`，见 SDK 的
+#      `fsl_romapi.c:61`），Rust 侧没有任何类型化封装可用；而这颗芯片在
+#      `imxrt-ral 0.6.2` 里**没有 flexspi 块**（1015/1061 才有），自己写 IP 命令
+#      只能靠手册逐位写位域 —— 那正是本项目禁止的"猜"。
+#   ② 不会引入 UB —— 三处分别只做：读固定 ROM 地址（`0x0020_001C`，ROM 常量区，
+#      读取无副作用）、按 SDK 原文复刻的 `repr(C)` 布局解引用（有 const 尺寸/偏移断言
+#      兜住"抄错顺序"）、以及调用 ROM 函数指针（参数为值/ROM 指针，调用前已有
+#      五道写入闸门：4 字节寻址自检、对齐、不跨页、只读拒绝、XIP 映射）。
+#      空指针一律返回 `None`，绝不调用零地址。
+#
+# 2026-10-12 批准新增 3 处（fault.rs），理由：
+#   ① 无法避免 —— 「上次为什么复位」只能读 `SRC_SRSR`（无 HAL 绑定）；
+#      `CFSR/HFSR/MMFAR/BFAR` 在 cortex-m 0.7.9 里只作为 `SCB` 的公开**字段**暴露，
+#      而异常处理器里拿不到 `SCB` 单例（它已被 `init` 取走）。这两件事没有安全替代。
+#   ② 不会引入 UB —— 五个寄存器全是只读状态（`SRSR` 是读 + 写 1 清零），
+#      地址是 ARMv7-M/i.MXRT 架构常量，读它们无副作用、无别名风险。
+#
+# 当前分布（55 处；**逐条不在这里重复计数** —— 精确数字以 `cargo xtask check-unsafe` 为准，
+# 这里的清单只说明"每一处的性质"，避免与代码漂移）：
+#   board-support/src/rom_flash.rs      Boot ROM 的 NOR 擦写驱动（树指针 + 两张 ROM 表 + 调用 + clear_cache）
+#   board-support/src/console.rs        LPUART1 实例获取、两个 IOMUXC 焊盘构造、接收/发送直写寄存器
+#   board-support/src/timer.rs          CCM/PIT 实例获取（只读访问与一次性初始化）
+#   board-support/src/sdram.rs          SEMC 寄存器直写、39 个 EMC 焊盘复用、CCM 时钟字段、
+#                                  SDRAM 地址窗口的 volatile 访问
+#   board-support/src/board.rs          调用上面几个 unsafe 初始化函数
+#   board-support/src/store.rs          FlexSPI XIP 区的只读访问（read_volatile）
+#   board-support/src/stacks.rs         栈空闲区的指纹涂抹与回读（栈余量测量）
+#   board-support/src/mpu.rs            MPU 区域配置与回读、cache 使能与状态读取
+#   board-support/src/fault.rs          SRC 实例（读/清 SRSR）与 SCB 四张只读故障
+#                                  状态寄存器（CFSR/HFSR/MMFAR/BFAR）的裸读
+#   board-support/src/rt.rs             DWT_CTRL / DEMCR 的只读回读与使能位**回写**（重装）
+#   board-support/src/alloc_pool.rs     `GlobalAlloc`（SDRAM 固定块静态池）
+#   board-support/src/cache.rs          `SCB.DCIMVAC` 按范围失效 D-Cache（写入路径的缓存一致性）
+#   board-support/src/dma.rs            非缓存 DMA 池的属性自证（写/失效/读回）
+#   board-support/src/flexcan.rs        FlexCAN2 寄存器直访（只读探针 + 写序列 + 引脚复用）
+#   board-support/src/flexspi_ip.rs     FlexSPI 寄存器直访（无 RAL 块，照 CMSIS 头抄偏移）
+#   board-support/src/ocotp.rs          OCOTP 熔丝影子寄存器的只读访问（设备身份）
+#   firmware/src/main.rs            `#[exception] unsafe fn HardFault`（签名由 cortex-m-rt 规定）
+#                                  与 RTIC init 里的独占板级初始化
+#   firmware/src/device.rs          RTIC 设备垫片的 steal()
+#   其余 crate                       0，以 `#![forbid(unsafe_code)]` 编译期保证
+#
+# ---------------------------------------------------------------------------
+# 2026-10-10 从 22 增至 29：新增 7 处全部属于 **SDRAM/SEMC 驱动**，逐条理由如下。
+#
+# ① 为什么无法避免：`imxrt-hal` 0.6 **没有** SEMC 模块（只有 lpuart/lpspi/lpi2c/
+#    gpt/flexpwm），`imxrt-iomuxc` 也**没有** SEMC 的焊盘复用数据。因此"让 SEMC
+#    工作"这件事在这套生态里没有安全封装可用 —— 要么直写寄存器，要么不用 SDRAM。
+#
+# ② 为什么这 7 处不会引入 UB：
+#    - 全部是**内存映射 I/O 的读写**：`read_volatile`/`write_volatile` 或 RAL 的
+#      `*Register` 访问，不构造 Rust 引用别名、不做生命周期假设；
+#    - SEMC 与那 39 个 EMC 焊盘**由本模块独占**，初始化只在 `board::init` 执行一次
+#      （此时中断未使能），此后只有 `Sdram` 的 volatile 读写；
+#    - `Sdram` 的 `Send`/`Sync` 断言的是"外部 SDRAM 是普通内存，任意上下文读写都不会
+#      破坏 Rust 内存模型"，且其内部访问一律 `read_volatile`/`write_volatile`，
+#      不做跨线程缓存假设；
+#    - 焊盘配置用"一张表 + 一次 unsafe"而不是 39 次类型化调用：后者会让预算从 19
+#      顶到 58，那种"预算"就不再有任何约束力。集中之后理由只需论证一次。
+#
+# ③ 更值得注意的是：这次真机调试（SEMC 映射错位、DQS 模式、1 字节接收 FIFO）
+#    证明了这一层的**风险确实集中在数值与寄存器语义**上。因此时序换算被抽到
+#    `sdram-timing`（纯逻辑、主机测试钉住），BSP 只留"把算好的值写进寄存器"。
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# 2026-10-10 从 29 增至 31：新增 2 处属于**栈余量测量**（`board-support/src/stacks.rs`）。
+#
+# ① 为什么无法避免：读当前 MSP 与"读写当前栈指针之下的空闲区"都在 Rust 的所有权模型
+#    之外。标准做法就是栈涂抹（stack painting）—— 用 `read_volatile`/`write_volatile`
+#    逐字写读。换成汇编或 extern 符号不会少一处 unsafe，只会把它挪到别处。
+#
+# ② 为什么不会引入 UB：
+#    - 区间由两个常量界定：`STACK_BOTTOM = 0x2000_0000`（`imxrt-rt` 把栈放在 DTCM 最低处）
+#      与 `STACK_SIZE`，后者与 `build.rs` 生成链接脚本用的 `STACK_BYTES` 由
+#      `consistency.rs` 里的编译期断言绑死 —— 涂错区间在这里是**编译失败**，不是运行时错误；
+#    - 只写 `[STACK_BOTTOM, SP-64)`：全部位于当前栈指针之下，即"本函数自己也不用"的范围；
+#    - 全程在 `critical_section` 内：否则中断可能把异常帧压进正被涂抹的区间（那才是真 UB）；
+#    - 逐字 `volatile`，不做引用投影、不构造 `&mut [u8]`，因此不产生别名假设。
+#
+# ③ 收益是实打实的：这个项目两次被栈打穿（8 KiB、16 KiB）都表现为"串口一行都不出"。
+#    加上这 2 处之后，启动横幅会打印实测峰值与余量（当前 19336 B / 32 KiB，余量 40%）。
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# 2026-10-10 从 31 增至 34：新增 3 处属于 **MPU 与缓存控制**（`board-support/src/mpu.rs`）。
+#
+# ① 为什么无法避免：MPU/SCB/CPUID 是 **ARM 核内寄存器**，`imxrt-ral` 不覆盖它们；
+#    `cortex-m` 只为它们提供类型，取用必须经过 `Peripherals::steal()`（unsafe）。
+#    "先 MPU、后缓存"的顺序与缓存维护序列也都在这些寄存器上。
+#
+# ② 为什么不会引入 UB：
+#    - 三处都是"初始化阶段独占"或"只读状态"：`init()` 由 RTIC `init` 在中断未使能时
+#      调用一次；`state()`/`describe_region()` 只读寄存器（后者写 RNR 仅为选中区域）；
+#    - 不构造任何别名引用：只通过 `Peripherals::steal()` 得到的外设包装类型访问；
+#    - MPU 区域表有**编译期断言**（基址按大小对齐、大小合法、Flash 必须只读 AP=6、
+#      SDRAM 必须是最高编号区域），改坏即构建失败；
+#    - 启动时会**回读硬件寄存器**并打印，所以"配置是否真的生效"有产物级证据。
+#
+# ③ 收益：真机实测 Flash 读吞吐 46.6 → 51.8 MiB/s（+11%，已接近 FlexSPI 100 MHz
+#    四线的线速）；更重要的是把 Flash 区标成**只读**（AP=6），缓存里因此永远不会有
+#    Flash 的脏行 —— 这是"绝不在无命令序列的情况下改写器件"的硬保证。
+# ---------------------------------------------------------------------------
+#
+# 2026-10-10 从 34 增至 35：新增 1 处属于 **OCOTP 只读访问**（`board-support/src/ocotp.rs`）。
+#
+# 2026-10-12 从 41 增至 47：新增 6 处 `board-support/src/alloc_pool.rs`（`GlobalAlloc` 实现 + 地址运算 + 清零）。
+#   ① 为什么无法避免：`GlobalAlloc` 的 `alloc`/`dealloc`/`alloc_zeroed` 在 Rust 里**只能**是
+#      `unsafe fn`（语言规定的签名），因此"给系统一个分配器"这件事本身无法避免 unsafe。
+#      但**策略**已被移出：块位图/耗尽/重复释放全在纯逻辑 crate `block-pool`（`forbid(unsafe_code)`）。
+#   ② 无 UB：池的内存是编译期常量地址 + 常量大小（4 条断言钉在 SDRAM 窗口内），
+#      元数据在 `.bss`；块来自互斥位图且只在临界区里取还；请求过大/对齐不足返回空指针；
+#      `dealloc` 反推不出块号或重复释放时只计数、不改位图、不 panic。
+#
+# 2026-10-12 从 40 增至 41：新增 1 处 `board-support/src/rt.rs` 的 DWT 使能位**回写**
+#   （`rearm_if_stopped()`）。
+#   ① 为什么无法避免：真机实测 `DEMCR.TRCENA`/`DWT_CTRL.CYCCNTENA` 会在某次 32 MiB 内存
+#      突发期间被清成 0，导致**整个实时仪表静默停摆**、并可能继续用陈旧样本报 `rt=ok`。
+#      要"被发现即自动重装"就只能在运行时把这两个使能位写回去，而 cortex-m 只暴露了读。
+#   ② 无 UB：只写两张架构常量地址、只改使能位（其余位保持读到的原值），内核私有寄存器，
+#      不影响任何外设；且只在计数器**已停**时才写。
+#
+# 2026-10-12 从 39 增至 40：新增 1 处 `board-support/src/rt.rs` 的 DWT_CTRL/DEMCR 只读回读。
+#   ① 为什么无法避免：实时仪表的全部结论都建立在"周期计数器在走"之上，而真机上出现过
+#      "以为在测、其实一次都没测"（心跳还照样打 rt=ok）。cortex-m 0.7.9 只暴露 CYCCNT，
+#      要使能位可见就只能裸读这两张只读寄存器。② 无 UB：只读、地址是架构常量、无副作用。
+#
+# 2026-10-12 从 35 增至 39：新增 4 处 —— 3 处在 `crates/board-support/src/fault.rs`，
+#   1 处是 `crates/firmware/src/main.rs` 的 `#[exception] unsafe fn HardFault`。
+#   HardFault 只有标记成 `unsafe fn` 才能拿到 `&ExceptionFrame`（硬件入栈帧）；
+#   不标就只能写一个不带帧的处理器，等于**主动放弃 PC/LR/SP**。
+# ① 为什么无法避免：「上次为什么复位」只能读 `SRC_SRSR`（无 HAL 绑定）；
+#    `CFSR/HFSR/MMFAR/BFAR` 在 cortex-m 0.7.9 里只作为 `SCB` 的公开**字段**暴露，
+#    而异常处理器里拿不到 `SCB` 单例（已被 `init` 取走）。这两件事没有安全替代。
+# ② 为什么不会引入 UB：五个寄存器全是只读状态（`SRSR` 是读 + 写 1 清零），
+#    地址是 ARMv7-M/i.MXRT 架构常量，读它们无副作用、无别名风险；
+#    写 `SRSR` 只写已知位（写 1 清零是该寄存器规定的清除方式）。
+# 背景：审计发现 `HardFault` 处理器在链接产物里就是个空死循环、全仓从不读 `SRSR`，
+#    于是设备挂掉后现场只剩"串口安静" —— 这 3 处 Unsafe 是换取"故障可解释"的代价。
+#
+# 2026-10-22 从 65 增至 71：`firmware` 的 `.uninit` 崩溃日志尾部镜像。
+#   ① **无法避免** —— `.uninit` 不被启动代码初始化，要在 HardFault/暖复位后保留最后
+#      几行日志，必须直接读写这个静态区，并对其做 D-Cache 失效/清理；安全 Rust 没有
+#      "不初始化静态 + 裸地址 + 缓存维护"的组合能力。
+#   ② **不会引入 UB** —— 访问范围固定为本文件独占的 `CrashLog`（4 KiB + 头），
+#      任何写入先按 `used <= CAP`/head 取模校验，环形写入有界；初始化先验证 magic，
+#      冷启动随机值直接清空；单线程启动/命令上下文访问，无别名。写入后清理 D-Cache，
+#      保证复位后 SRAM 是最新值；读取前失效 D-Cache，避免读缓存旧行。
+
+# 2026-10-22 从 71 增至 73：`board-support/src/fs.rs` 的持久化索引静态缓冲。
+#   ① 无法避免 —— 16 KiB 快照若放栈会叠在启动期 33 KiB 栈峰上超过 48 KiB；必须用静态区，
+#      且要拿到可变切片；安全 Rust 不能从 static 取 &mut。
+#   ② 不会引入 UB —— 本模块独占 INDEX_BUF；mount/checkpoint 单线程顺序调用，不并发；
+#      读取长度由 device read 返回、写入长度由 export_index 返回并做上界校验。
+
+# 2026-10-22 从 73 增至 76：`board-support/src/fs.rs` 的静态 FS 存储 + 指针安装。
+#   ① 无法避免 —— 13.7 KiB FileSystem 在 measured_cs 内搬移会造成 1.2 ms irq-off；
+#      改为写入静态 MaybeUninit，再发布 usize 地址，临界区只写一个指针。
+#   ② 不会引入 UB —— FS_STORAGE 只在 install 写入一次，写完才发布地址；with_fs_owner
+#      由 FS_BUSY 独占，with_fs 在 busy 时返回 None；地址来自同一静态对象，生命周期
+#      覆盖整个固件运行期。
+
+# 2026-10-22 从 76 增至 79：board-support/src/fs_volume.rs 的全局 v3 实例。
+#   ① 无法避免 —— v3 卷要跨命令/启动复用，必须放静态 MaybeUninit；Rust 无 safe
+#      的“未初始化静态 + 一次写入 + 随后取 &mut”表达。
+#   ② 不会引入 UB —— 只在 mount_v3/format_v3 单线程写入一次，写完再置 V3_READY；
+#      with_v3 先读 V3_READY 再 assume_init_mut，当前无并发调用者。
+blocks=81
+
+# 2026-10-13 批准新增 1 处（board-support/src/flexcan.rs，`pe_clock_hz` —— 读真实 PE 时钟），理由：
+#   ① **无法避免** —— 读 `CCM_CSCMR2[CAN_CLK_PODF]` 必须取 `CCM` 实例，而
+#      `CCM::instance()` 本身就是 unsafe（外设寄存器的别名规则）；
+#   ② **不会引入 UB** —— 只**读**一个字段、不做任何写；实例唯一性由"只在启动阶段
+#      单线程调用"保证（与 `enable_can2` 同一前提）；
+#   ③ **它是必须报的事实**：位时序由 PE 时钟算出，而 PE 时钟由 `CAN_CLK_SEL`（offset 8）
+#      与 `CAN_CLK_PODF`（offset 2，**同一个 `CSCMR2` 寄存器**）共同决定。
+#      真机实测 `PODF = 1` ⇒ **PE = 12 MHz，而不是我假定的 24 MHz** —— 正是这个未经核实的
+#      假定让位时序偏掉，进而"发送正常但接收不通"。这条读数把假定换成了实测值。
+
+# 2026-10-19 从 55 增至 56：新增 1 处 `board-support/src/cache.rs` 的 `clean_dcache_range`
+# （`SCB::steal()` + `clean_dcache_by_address`）。理由：
+#   ① **无法避免** —— `.uninit` 在可缓存 OCRAM；跨暖复位的崩溃记录/复位计数写完后
+#      必须把 D-Cache 行写回 SRAM，否则复位可能丢掉记录（真机实测复位计数"心跳里 0、
+#      复位后又是旧值"）。cortex-m 0.7.9 的 clean API 需要 `&mut SCB`，而异常处理器
+#      里拿不到单例，只能 `steal`。
+#   ② **不会引入 UB** —— 只调用缓存维护方法（DCCMVAC），不改外设、不改内存语义；
+#      调用是单核、短生命周期，不与其他 SCB 使用者并发。
+
+# 2026-10-19 从 56 增至 57：`firmware/src/main.rs` 的 SDRAM 文本日志环分配。
+#   ① **无法避免** —— 64 KiB 不能放 `.bss`（OCRAM 余量不够），也不能写成
+#      `Box::new([0u8; 64 * 1024])`（数组先建在栈上，直接打穿 48 KiB 栈；
+#      真机已复现 Lockup）。必须从 SDRAM 大块池直接申请并构造独占切片。
+#   ② **不会引入 UB** —— 申请的是 `Layout(64 KiB, 8)` 的独占块；失败时返回空指针
+#      并显式放弃日志；切片只构造一次、只由 `LOG` 独占使用，无别名、无释放。
+
+# 2026-10-19 从 57 增至 58：`firmware` 用 .bss 小静态缓冲做 TextLog 最小复现。
+#   ① 无法避免 —— 需要 `&'static mut [u8]`，Rust 安全代码无法从 static 取得独占切片；
+#   ② 不会引入 UB —— 只初始化一次、仅 LOG 独占使用，无别名/释放。
+
+# 2026-10-19 从 56 增至 57：`board-support/src/fs.rs` 的 `with_fs_owner` 改为原地借用。
+#   ① 无法避免 —— 旧的 take/put 把 13.7 KiB FlashFs 搬上栈，日志/队列路径实测 27 KiB
+#      栈帧直接 STKERR；要原地借用必须从静态取裸指针并交给闭包。
+#   ② 不会引入 UB —— FS_BUSY 在临界区内占位，with_fs 看到忙即返回 None，
+#      重入也被拒绝；闭包执行期间没有别名；执行完立即清标志。
+
+# 2026-10-19 从 57 增至 58：日志环改 SDRAM NOLOAD 静态区，需构造 'static 可变切片。
+#   ① 无法避免 —— 64 KiB 环不能放 OCRAM；安全代码无法从静态取得独占 &mut [u8]。
+#   ② 不会引入 UB —— 区独占、只初始化一次，日志路径单线程顺序使用。
+
+# 2026-10-20 从 58 增至 59：`firmware` 的 `.sdram_gzip` 输入/输出 SDRAM 缓冲。
+#   ① 无法避免 —— 64/128 KiB 缓冲不能放 OCRAM；安全代码无法构造 'static 独占切片。
+#   ② 不会引入 UB —— `.sdram_gzip` 独占、只在终端命令/idle 单线程顺序使用。
+
+# 2026-10-20 从 59 增至 65：gzip 压缩任务在 SDRAM 栈执行。
+#   ① 无法避免 —— 需要从裸指针恢复 CompressJob，并构造输入/输出切片。
+#   ② 调用方持有 job，压缩期间无并发；naked 切换前后 SP 明确。
+
+# 2026-10-20 从 62 增至 64：gzip SDRAM 栈涂抹/回读峰值与 canary。
+#   ① 无法避免 —— 需要直接写/读 SDRAM 静态栈区。
+#   ② 压缩前后单线程使用；canary 在栈底，越界即判失败。
+
+# 2026-10-21 从 64 增至 65：压缩器状态常驻，任务内从裸指针取 &mut state。
+#   ① 无法避免 —— 任务结构跨裸栈传递状态指针。
+#   ② 状态由 GZIP_STATE 独占，压缩期间无并发。
+
+# 2026-10-22 从 79 增至 80：`.dtcm` 段启动清零（board-support/src/stacks.rs）。
+#   ① 无法避免 —— NOLOAD 段没有加载器拷贝，必须直接按链接符号写零。
+#   ② 只在 board::init 最开头执行一次；区间由链接脚本 __sdtcm/__edtcm 定义，
+#      长度按两端地址计算，不越界；清零后 .dtcm 静态量才被使用。
+
+# 2026-10-22 从 80 增至 81：启动最开头清零 `.dtcm`（firmware::app::init）。
+#   ① 无法避免 —— 必须在 rt::reset 前调用清零入口，入口本身是 unsafe fn。
+#   ② 只执行一次，早于所有 `.dtcm` 静态量使用；SAFETY 注释在调用点。

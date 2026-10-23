@@ -1,0 +1,52 @@
+[package]
+name = "firmware"
+description = "PJ0007_TF2 主控板（i.MX RT1021）固件：RTIC 组合根与平台运行时"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+
+[dependencies]
+realtime = { path = "../realtime" }
+fault-decode = { path = "../fault-decode" }
+# 分层：本 crate 是**组合根**，只做接线，不含应用判断。
+primitives.workspace = true
+log = { path = "../log" }
+gzip = { path = "../gzip", features = ["compress"] }
+ports.workspace = true
+wire-format.workspace = true
+board-support.workspace = true
+nor-flash.workspace = true
+flash-layout.workspace = true
+mpu-regions.workspace = true
+sdram-timing.workspace = true
+shell.workspace = true
+sdk = { path = "../sdk" }
+# 产品组合根已外提为独立 crate：本 crate 不再决定 capsule 集合与注册顺序。
+product = { path = "../product" }
+
+rtic.workspace = true
+cortex-m = { workspace = true, features = ["critical-section-single-core"] }
+critical-section = "1.2"
+cortex-m-rt.workspace = true
+# `rt` feature 必须开：它带来 `device.x`（中断弱别名）与 `__INTERRUPTS` 矢量表。
+imxrt-ral.workspace = true
+imxrt-rt.workspace = true
+
+[build-dependencies]
+# imxrt-rt 必须在 [dependencies] 与 [build-dependencies] 两处同时出现且 feature 一致：
+# 前者提供 `__pre_init`/`DefaultHandler_` 的运行时代码，后者生成链接脚本。
+imxrt-rt.workspace = true
+
+[features]
+default = []
+# 现场需要纯文本日志的降级通道（当前为默认通道，见 docs/02-架构/并发与实时预算.md）。
+text-log = []
+
+[lints]
+workspace = true

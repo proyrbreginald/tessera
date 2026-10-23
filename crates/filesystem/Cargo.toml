@@ -1,0 +1,16 @@
+[package]
+name = "filesystem"
+description = "外部 QSPI NOR Flash 上的日志结构文件系统：掉电安全、记录级 CRC、版本完整性判定、垃圾回收与磨损分散（纯逻辑，主机可测）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 只复用 CRC-16/MODBUS（块头校验）。记录级校验用本 crate 内的 CRC-32，
+# 理由见 `crate::crc32`：64 KiB 级记录用 16 位校验和的漏检率不可接受。
+primitives.workspace = true
+
+[lints]
+workspace = true

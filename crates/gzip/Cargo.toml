@@ -1,0 +1,27 @@
+[package]
+name = "gzip"
+description = "gzip 容器（RFC 1952）+ DEFLATE（RFC 1951）：纯 Rust、no_std、零分配（纯逻辑，主机可测）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# 压缩侧的 `CompressorOxide` 内部是若干 `Box`（合计约 230 KB），
+# 因此需要 `miniz_oxide/with-alloc` ⇒ 需要**全局分配器**。
+# 本工程的分配器（`board-support/src/alloc_pool.rs`）已扩成**双固定块静态池**：
+# 小块 1 KiB×2048 + **大块 64 KiB×32（2 MiB，SDRAM）**，压缩器状态落在大块池里。
+# 仍是"固定块、无碎片、静态可知、失败返回空指针"，没有引入通用堆。
+default = ["compress"]
+compress = ["miniz_oxide/with-alloc"]
+
+[dependencies]
+primitives = { path = "../primitives" }
+# `default-features = false` 去掉 `with-alloc`：本 crate 的编解码全部走
+# "调用方给缓冲区与状态"的入口，不需要堆。这是本项目"内存用量静态可知"的一部分。
+miniz_oxide = { workspace = true, default-features = false }
+static_assertions.workspace = true
+
+[lints]
+workspace = true

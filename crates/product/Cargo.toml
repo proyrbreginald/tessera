@@ -1,0 +1,14 @@
+[package]
+name = "product"
+description = "Tessera 默认产品组合根：把平台注入的基础 capsule 按固定顺序装配成 sdk::Product"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sdk = { path = "../sdk" }
+
+[lints]
+workspace = true

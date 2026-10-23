@@ -1,0 +1,20 @@
+[package]
+name = "shell"
+description = "仿 Fedora 风格的串口终端：行编辑、ANSI 渲染、命令分发（纯逻辑，主机可测）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+primitives.workspace = true
+# 实时性实测快照（`rt` 命令）：`realtime` 与 `primitives` 一样是**纯逻辑**
+# crate，依赖它不会把任何硬件 crate 带进依赖闭包（`cargo xtask check-layering` 验证）。
+# 用路径依赖而不是 `workspace = true`：与 `firmware` 引用它的写法一致，
+# 免得为一个依赖去动工作区的 `[workspace.dependencies]`。
+realtime = { path = "../realtime" }
+filesystem = { path = "../filesystem" }
+
+[lints]
+workspace = true

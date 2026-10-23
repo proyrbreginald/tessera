@@ -1,0 +1,72 @@
+# Tessera（静态 capsule 化 MCU 实时内核）的 GitLab CI（内网 code.pudu.work）
+#
+# 设计原则：**CI 只调用 `cargo xtask`**，不重复实现任何检查逻辑。
+# 一份逻辑跑在本地（make verify）与 CI 两处，才谈得上"本地绿 == CI 绿"。
+#
+# 离线注意：本工程的依赖可以完全离线构建（见 docs/04-开发/构建与工具链.md）。
+# 若 runner 有网，可去掉 --offline。
+
+stages:
+  - gates
+  - test
+  - build
+
+default:
+  image: rust:stable
+  before_script:
+    - rustup target add thumbv7em-none-eabihf || true
+    - rustup component add rustfmt clippy || true
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cargo/registry/
+      - target/
+
+# 静态门禁：**一条命令跑全部 17 项**（`gates` 汇总表，不因第一个失败而中断）。
+# 这份清单不在这里复述 —— 复述必然漂移（历史上 CI 曾漏掉 check-flash-map/check-size）。
+gates:
+  stage: gates
+  script:
+    - cargo xtask gates
+
+format-and-lint:
+  stage: gates
+  script:
+    - cargo fmt --all --check
+    - cargo xtask lint-target
+    - cargo xtask lint-host
+
+# 主机测试：纯逻辑层全部 crate（列表唯一来源是 xtask 的 PURE_CRATES）。
+host-tests:
+  stage: test
+  script:
+    - cargo xtask test-host
+
+# 编译失败用例：证明类型约束真的拦得住（Cycles 非零）。
+compile-fail:
+  stage: test
+  script:
+    - cargo xtask check-compile-fail
+
+# 目标构建 + 产物级断言（FCB/IVT/向量表/体积/分区表）。
+firmware-image:
+  stage: build
+  script:
+    - cargo build --release
+    - cargo xtask check-image
+    - cargo xtask check-size
+    - cargo xtask check-flash-map
+  artifacts:
+    paths:
+      - target/thumbv7em-none-eabihf/release/firmware
+    expire_in: 1 week
+
+# 真机在环（HIL）刻意**不在**默认流水线里：它需要探针与目标板，
+# 且失败原因常与固件无关（见 docs/04-开发/台架准备与排障.md）。
+# 需要时手动触发。
+hil-manual:
+  stage: build
+  when: manual
+  allow_failure: true
+  script:
+    - bash scripts/check-bench.sh

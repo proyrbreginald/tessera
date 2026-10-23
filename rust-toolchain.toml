@@ -1,0 +1,15 @@
+# 工具链策略：**永远跟随最新 stable，不锁定具体版本**。
+#
+# 这是刻意的选择：本项目不把"可复现"建立在"钉死一个 rustc 版本号"上。
+# 原因有两条：
+#   1. 钉死具体版本（例如写 "1.98.1" 或比对 rustc -vV）会让离线/内网环境
+#      必须预装那个精确工具链，升级时所有开发机与 CI 一起卡住；
+#   2. 依赖可复现性由 **Cargo.lock + xtask/Cargo.lock 入库** 保证 ——
+#      同一份锁文件在任何 stable 上解析出同一组依赖版本。
+#
+# 因此这里只声明通道与最小组件集合，具体版本由 rustup 的 stable 通道提供。
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["thumbv7em-none-eabihf"]

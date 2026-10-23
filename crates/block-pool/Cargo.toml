@@ -1,0 +1,13 @@
+[package]
+name = "block-pool"
+description = "固定块静态池的**策略**（纯逻辑，主机可测）：块位图、高水位与耗尽统计；内存本身在 BSP 的 SDRAM 静态区里"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

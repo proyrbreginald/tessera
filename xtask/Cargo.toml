@@ -1,0 +1,26 @@
+[package]
+name = "xtask"
+description = "构建与产物门禁：分层、unsafe 预算、需求追溯、镜像布局、体积"
+# 独立工作区，因此不能继承主工作区的 package 字段。
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# 唯一的外部依赖：真 ELF 解析。产物级断言必须基于**链接后的镜像**，
+# 而不是基于源码里的结构体 —— 前者才能证明"这些值真的落到了镜像里"。
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
+
+# Flash 分区表：与固件**共用同一份数据**（这是把它做成纯 crate 的原因）。
+# 门禁直接遍历它，不去解析源码，也就不可能"文档写一套、代码跑另一套"。
+flash-layout = { path = "../crates/flash-layout" }
+# 内存布局与栈余量的事实来源（片内 RAM 划分、栈大小、ITCM 代码预算）。
+memory-layout = { path = "../crates/memory-layout" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# 独立工作区：与固件工作区解耦（它永远只在主机上构建）。
+[workspace]

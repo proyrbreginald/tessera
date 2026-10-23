@@ -1,0 +1,15 @@
+[package]
+name = "mpu-regions"
+description = "MPU 区域表与 RBAR/RASR 的编解码：纯逻辑、主机可测（真正写寄存器仍留在 BSP）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+memory-layout = { path = "../memory-layout" }
+
+[lints]
+workspace = true

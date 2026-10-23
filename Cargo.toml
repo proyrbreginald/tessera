@@ -1,0 +1,139 @@
+# Tessera 工作区（静态 capsule 化 MCU 实时内核）
+#
+# # 分层是**编译期事实**，不是纪律
+#
+# 真实的寄存器写入、中断与电气连接无法用主机测试替代。既然如此，就让"不可测的部分"
+# 尽可能薄，并让"纯逻辑层不依赖任何硬件"成为 Cargo 依赖图上的事实：
+#
+#     primitives   纯领域逻辑        依赖闭包里没有 imxrt-*/cortex-m/rtic
+#     wire-format  线路编解码        依赖 core
+#     ports  端口契约 + 类型状态机  依赖 core
+#     sdram-timing   SDRAM 时序换算与内存测试算法  依赖 core（纯算术，主机可测）
+#     shell  串口终端的行编辑/ANSI/命令分发  依赖 core（纯逻辑，主机可测）
+#     flash-layout Flash 用途划分  无依赖（BSP、xtask 与文档的共同事实来源）
+#     simulator    主机侧仿真替身    依赖 ports/proto      （仅测试与被测逻辑，零硬件）
+#     sdk          capsule 契约 + 固定容量静态组合（纯逻辑）
+#     product      产品组合根：声明 capsule 集合/顺序/容量，只依赖 sdk（纯逻辑）
+#     board-support    板级支持          **唯一**允许依赖 imxrt-* 的库 crate
+#     firmware     RTIC 应用（bin）  平台注入：把上面几层接起来，组合策略在 product
+#     xtask           构建/产物门禁     仅主机，纯 std
+#
+# `cargo xtask check-layering` 会解析依赖闭包并强制这条规则；`check-unsafe` 强制
+# unsafe 预算；`check-lint-headers` 强制每个 crate 带标准 lint 头。三者都在
+# `make verify` 里跑。
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/primitives",
+    "crates/wire-format",
+    "crates/ports",
+    "crates/sdram-timing",
+    "crates/shell",
+    "crates/flash-layout",
+    "crates/mpu-regions",
+    "crates/memory-layout",
+    "crates/realtime",
+    "crates/fault-decode",
+    "crates/block-pool",
+    "crates/log",
+    "crates/gzip",
+    "crates/nor-flash",
+    "crates/filesystem",
+    "crates/simulator",
+    "crates/sdk",
+    "crates/product",
+    "crates/board-support",
+    "crates/firmware",
+]
+
+# xtask 刻意**不是**工作区成员：它是主机专用工具（依赖 std），
+# 留在成员里会让默认的固件构建去为目标端编译主机依赖。
+# 它有自己的 `[workspace]`，通过 `cargo xtask` 别名调用（见 .cargo/config.toml）。
+exclude = ["xtask"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# --- 纯逻辑层共用 ---------------------------------------------------------
+# 固定容量容器：无堆分配是安全论证的一部分（内存用量静态可知），
+# 因此全项目统一用 heapless 而不是 Vec/String。
+heapless = "0.9"
+# DEFLATE（RFC 1951）：纯 Rust、`no_std`、可关掉 `with-alloc`。
+# 选它而不是自己写 DEFLATE —— 它是 `flate2` 的后端，被广泛验证；
+# 而且产品族里既有的 `GzFile` 是 zlib 的 **C FFI**（`gzopen`/`gzread`），
+# 与本项目"100% Rust"的口径不符，不能照搬。
+miniz_oxide = { version = "0.9", default-features = false }
+# 编译期断言：把"预算/布局/尺寸一致性"变成编译失败而不是运行时惊喜。
+static_assertions = "1.1"
+
+# --- 并发框架 -------------------------------------------------------------
+# RTIC v2：编译期静态优先级 + 无锁资源借用 + 零动态分配。
+# 后端 feature 必须显式选：Cortex-M7 属 ARMv7-M，用 thumbv7-backend。
+# 换芯片（M33 等）只需改这一处 feature。
+rtic = { version = "2.3", features = ["thumbv7-backend"] }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+
+# --- 芯片支持 -------------------------------------------------------------
+# 注意两个 feature 的命名口径不同：RAL 按**精确型号**（imxrt1021），
+# HAL 按**家族**（imxrt1020，覆盖 1021）。
+#
+# RAL 的 `rt` feature 必须开：它把 `device.x`（各外设中断的 PROVIDE 弱别名）
+# 与 `__INTERRUPTS` 矢量表带进来。不开会得到一堆 "undefined symbol: LPUART2"。
+imxrt-ral = { version = "0.6", features = ["imxrt1021", "rt"] }
+imxrt-hal = { version = "0.6", features = ["imxrt1020"] }
+# `device` feature 必须开，否则 imxrt-rt 生成的链接脚本里不会 `INCLUDE device.x`。
+# 它必须在 [dependencies] 与 [build-dependencies] 两处同时开。
+imxrt-rt = { version = "0.1", features = ["device"] }
+imxrt-boot-gen = "0.4"
+
+# --- 工作区内部 -----------------------------------------------------------
+primitives = { path = "crates/primitives" }
+wire-format = { path = "crates/wire-format" }
+ports = { path = "crates/ports" }
+sdram-timing = { path = "crates/sdram-timing" }
+shell = { path = "crates/shell" }
+nor-flash = { path = "crates/nor-flash" }
+flash-layout = { path = "crates/flash-layout" }
+mpu-regions = { path = "crates/mpu-regions" }
+memory-layout = { path = "crates/memory-layout" }
+filesystem = { path = "crates/filesystem" }
+simulator = { path = "crates/simulator" }
+board-support = { path = "crates/board-support" }
+
+[workspace.lints.rust]
+# 在 unsafe fn 内部也必须显式写 unsafe 块：避免"整个函数是 unsafe 于是内部随便写"。
+unsafe_op_in_unsafe_fn = "deny"
+# 禁止对 static mut 取引用：有 critical-section / 原子 / spsc 队列等充分替代。
+static_mut_refs = "deny"
+elided_lifetimes_in_paths = "deny"
+unreachable_pub = "warn"
+missing_docs = "warn"
+
+# 注意：`unsafe_code` **不在这里**统一 deny。
+# 原因是 BSP 层需要受控的 unsafe，而 `forbid` 无法被下游 allow；相反若在这里
+# `deny`，纯逻辑层的保护就变成"靠继承"而不是"靠自己声明"。因此规则是：
+# **每个纯逻辑 crate 以 `#![forbid(unsafe_code)]` 开头**，由
+# `cargo xtask check-lint-headers` 强制该行存在。unsafe 的"预算"由
+# `check-unsafe` 与 `unsafe.budget` 文件看守。
+
+[profile.dev]
+opt-level = 1
+debug = 2
+
+[profile.release]
+opt-level = "s"      # 体积优先：主固件门禁 < 1 MiB
+lto = "fat"
+codegen-units = 1
+debug = 2            # 保留调试信息：黑匣子与现场分析需要
+overflow-checks = true   # 安全相关：整数溢出必须显式暴露，而不是静默回绕
+panic = "abort"
+
+[profile.test]
+opt-level = 1

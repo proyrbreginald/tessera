@@ -1,0 +1,11 @@
+[package]
+name = "cf-span-record-zero-is-a-type-error"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立工作区：负例不是主工作区的成员，否则会被当作误入工作区的包。
+[workspace]
+
+[dependencies]
+realtime = { path = "../../../crates/realtime" }

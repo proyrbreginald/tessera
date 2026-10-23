@@ -1,0 +1,18 @@
+[package]
+name = "primitives"
+description = "平台原语：时间、实时预算、健康门控、格式化、随机数、校验"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 唯一依赖：固定容量容器。依赖闭包里没有 imxrt-*/cortex-m/rtic ——
+# 这既让本 crate 能在主机上 `cargo test`，也让"业务逻辑不认识硬件"
+# 成为编译期事实而非纪律。`cargo xtask check-layering` 会强制这一点。
+heapless.workspace = true
+static_assertions.workspace = true
+
+[lints]
+workspace = true

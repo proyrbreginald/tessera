@@ -1,0 +1,13 @@
+[package]
+name = "flash-layout"
+description = "外部 QSPI Flash 的用途划分：分区表作为 BSP、门禁与文档的共同事实来源"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

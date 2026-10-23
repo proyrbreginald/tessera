@@ -1,0 +1,13 @@
+[package]
+name = "memory-layout"
+description = "片内内存布局事实与栈余量测量的纯逻辑：主机可测（真正读写内存仍留在 BSP）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

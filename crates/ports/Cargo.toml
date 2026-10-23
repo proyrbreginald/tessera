@@ -1,0 +1,18 @@
+[package]
+name = "ports"
+description = "硬件无关的端口契约（Bus/Clock/Store/LogSink）与基于契约的类型状态机"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+primitives.workspace = true
+
+[dev-dependencies]
+# 仅测试用：容量固定的向量。目标构建不引入它。
+heapless.workspace = true
+
+[lints]
+workspace = true

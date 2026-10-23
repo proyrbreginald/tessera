@@ -1,0 +1,16 @@
+[package]
+name = "wire-format"
+description = "线路编解码：Modbus-RTU 帧结构与 CRC（零拷贝、零分配；功能码不透明，不解释设备语义）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 协议层依赖领域层（用于标识类型），反过来不成立。
+# 依赖方向由 `cargo xtask check-layering` 强制。
+primitives.workspace = true
+
+[lints]
+workspace = true

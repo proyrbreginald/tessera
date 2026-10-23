@@ -1,0 +1,15 @@
+[package]
+name = "realtime"
+description = "实时性仪表：关中断/ISR/任务步长的实测统计与预算判据（纯逻辑，主机可测）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+primitives = { path = "../primitives" }
+static_assertions.workspace = true
+
+[lints]
+workspace = true

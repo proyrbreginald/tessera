@@ -1,0 +1,32 @@
+[package]
+name = "board-support"
+description = "板级支持：唯一允许接触 imxrt-* 寄存器的 crate（unsafe 集中且受预算门禁约束）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+realtime = { path = "../realtime" }
+fault-decode = { path = "../fault-decode" }
+primitives.workspace = true
+ports.workspace = true
+wire-format.workspace = true
+sdram-timing.workspace = true
+nor-flash.workspace = true
+flash-layout.workspace = true
+filesystem.workspace = true
+mpu-regions.workspace = true
+block-pool = { path = "../block-pool" }
+memory-layout.workspace = true
+
+cortex-m = { workspace = true, features = ["critical-section-single-core"] }
+critical-section = "1.2"
+heapless.workspace = true
+imxrt-ral.workspace = true
+imxrt-hal.workspace = true
+imxrt-boot-gen.workspace = true
+
+[lints]
+workspace = true

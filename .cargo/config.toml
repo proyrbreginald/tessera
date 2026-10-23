@@ -1,0 +1,28 @@
+# Cargo 构建配置
+#
+# 两个刻意的选择，都是踩过坑之后定下来的：
+#
+# 1. 默认目标是**固件目标**：本仓库的默认产物是嵌入式固件，不是主机程序。
+#    主机测试必须显式写 `--target x86_64-unknown-linux-gnu`（`make test` 已封装）。
+#
+# 2. `rustflags` 挂在 `[target.thumbv7em-none-eabihf]` 而**不是** `[build]`。
+#    挂在 `[build]` 下会让主机测试的链接也带上 `-Timxrt-link.x`，于是
+#    `cargo test` 报 "cannot find linker script imxrt-link.x"。这个坑很隐蔽：
+#    固件能编、只有测试挂。
+#
+# 链接脚本用 `imxrt-link.x`（由 `imxrt-rt` 的 build.rs 在 OUT_DIR 生成，自带
+# MEMORY 段），**不要**换成 cortex-m-rt 的 `link.x` —— 那个要求你自己提供 memory.x。
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "link-arg=-Timxrt-link.x"]
+# 直接 `cargo test` 会落到这个 target 上。目标端测试需要真实硬件（HIL），
+# 未接线时给一条明确的错误信息，而不是内核那句 "exec format error"。
+runner = "bash scripts/target-runner.sh"
+
+# xtask 走 `--manifest-path` 而非 `--package`：它不是工作区成员。
+# 必须显式指定主机 target，否则会继承上面的 `[build] target`（固件目标）而编译失败。
+[alias]
+xtask = "run --target x86_64-unknown-linux-gnu --manifest-path xtask/Cargo.toml --"
