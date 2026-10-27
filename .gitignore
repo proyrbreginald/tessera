@@ -22,9 +22,6 @@ tests/compile-fail/*/Cargo.lock
 # 参考手册的抽取文本（由 docs/manual/*.pdf 派生，全仓无引用）：不入库。
 /.pdftxt
 
-# 编辑器本地配置（不是项目资产）
-.vscode/
-
 # Python 缓存（脚本运行时生成，不是项目资产）
 __pycache__/
 *.pyc
