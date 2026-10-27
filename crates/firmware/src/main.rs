@@ -3467,7 +3467,7 @@ fn selftest_flash_write() -> bool {
     flash_ok
 }
 
-/// 目标端自检：逐条执行并打印，`make test-target` 解析。
+/// 目标端自检：逐条执行并打印，`cargo xtask test-target` 解析。
 #[inline(never)]
 #[unsafe(link_section = ".xip")]
 fn run_selftest(out: &mut dyn core::fmt::Write) -> bool {

@@ -13,7 +13,7 @@
 
 # 用法
 
-    make bytecheck                 # 用 udev 别名，复位并抓 15 秒
+    cargo xtask bytecheck                 # 用 udev 别名，复位并抓 15 秒
     python3 scripts/console-bytecheck.py --seconds 20 --port /dev/ttyUSB0
 
 退出码 0 = 全部逐字节一致；非 0 = 有缺失/错位，并打印缺失的那一条。
@@ -161,7 +161,7 @@ def capture(port: str, seconds: float) -> bytes:
     try:
         import serial  # type: ignore
     except ImportError:
-        print("缺少 pyserial：make setup", file=sys.stderr)
+        print("缺少 pyserial：cargo xtask setup", file=sys.stderr)
         raise SystemExit(2)
 
     with serial.Serial(port, 115200, timeout=0.2) as link:

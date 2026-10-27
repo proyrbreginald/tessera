@@ -9,7 +9,7 @@
 # 都找不到就报错并给出处置命令 —— 而不是让调用方在别处看到含糊的 "command not found"。
 
 # 「相邻项目的 venv」是一个**环境事实**（本机台架工具的共享位置），不是本项目的依赖：
-# 换机器时用 ALT_VENV 覆盖，或干脆 `make setup` 用本项目自己的 .venv。
+# 换机器时用 ALT_VENV 覆盖，或干脆 `cargo xtask setup` 用本项目自己的 .venv。
 ALT_VENV="${ALT_VENV:-/home/reginald/project/elevator-protocol-gateway/.venv}"
 
 resolve_pyocd() {
@@ -40,8 +40,8 @@ require_pyocd() {
     if ! pyocd="$(resolve_pyocd)"; then
         cat >&2 <<'MSG'
 [台架] 找不到 pyocd。处置（任选其一）：
-    make setup                     # 在本项目建 .venv 并安装 pyocd
-    PYOCD=/path/to/pyocd make flash    # 显式指定
+    cargo xtask setup                     # 在本项目建 .venv 并安装 pyocd
+    PYOCD=/path/to/pyocd cargo xtask flash    # 显式指定
 MSG
         return 1
     fi

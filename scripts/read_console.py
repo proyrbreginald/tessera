@@ -15,7 +15,7 @@ import time
 try:
     import serial  # type: ignore
 except ImportError:
-    print("缺少 pyserial：make setup", file=sys.stderr)
+    print("缺少 pyserial：cargo xtask setup", file=sys.stderr)
     raise SystemExit(2)
 
 BEAT = re.compile(r"uptime=(\d+)\.(\d{3})s")

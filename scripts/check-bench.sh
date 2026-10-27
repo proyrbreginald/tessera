@@ -69,7 +69,7 @@ echo "== 4. 烧录工具 =="
 if pyocd_path="$(resolve_pyocd)"; then
     echo "  ✅ pyocd: $pyocd_path"
 else
-    echo "  ❌ 找不到 pyocd（make setup，或用 PYOCD=... 指定）"
+    echo "  ❌ 找不到 pyocd（cargo xtask setup，或用 PYOCD=... 指定）"
     fail=1
 fi
 

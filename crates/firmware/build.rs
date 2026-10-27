@@ -208,7 +208,7 @@ fn emit_banner(version: &str) {
         "banner.txt 有 {lines} 行，超过上限 {MAX_BANNER_LINES} 行"
     );
     // 空行在 print_banner 里会被逐行写成真正的空行：图形每行之间多一条空白，
-    // 而且 `make bytecheck` 只核对第一行，抓不到这种"看起来像字体问题"的漂移。
+    // 而且 `cargo xtask bytecheck` 只核对第一行，抓不到这种"看起来像字体问题"的漂移。
     // 这里的首行/行距由 print_banner 自己控制，banner.txt 里出现空行几乎一定是
     // 粘贴时多带了换行 —— 构建期直接拒绝，避免同一版固件因源文件差异输出不同。
     assert!(

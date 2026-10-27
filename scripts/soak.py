@@ -2,8 +2,8 @@
 """长稳（soak）采集与判据：在真机上持续读心跳，统计复位/丢字节/实时违规/时基漂移。
 
 用法：
-    make soak                          # 默认 30 分钟
-    SOAK_MINUTES=5 make soak           # 短稳验证脚本本身
+    cargo xtask soak                          # 默认 30 分钟
+    cargo xtask soak --minutes 5           # 短稳验证脚本本身
     .venv/bin/python scripts/soak.py --minutes 60 --out-dir tmp/soak
 
 判据（任一失败即退出码 1）：
@@ -15,7 +15,7 @@
 - 时基漂移超过 ±2%；
 - 1 ms 节拍频率偏离 1000 Hz 超过 ±2%。
 
-为什么单独写：`make monitor` 只看 10 秒；长期漂移、累积丢字节、偶发复位只有
+为什么单独写：`cargo xtask monitor` 只看 10 秒；长期漂移、累积丢字节、偶发复位只有
 在小时级窗口里才会出现。原始串口输出和 JSON 摘要都落到 `tmp/soak/`，便于归档。
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ from datetime import datetime
 try:
     import serial  # type: ignore
 except ImportError:
-    print("缺少 pyserial：make setup", file=sys.stderr)
+    print("缺少 pyserial：cargo xtask setup", file=sys.stderr)
     raise SystemExit(2)
 
 # 与固件 `report_beat` 的格式**逐字段对应**（2026-10-27 起带 `covr=`）。

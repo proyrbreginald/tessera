@@ -8,9 +8,9 @@ cat >&2 <<'MSG'
 [runner] 这是目标端（thumbv7em-none-eabihf）产物，不能在主机上运行。
 
 主机测试请用：
-    make test          # 等价于 cargo test --target x86_64-unknown-linux-gnu -p <纯逻辑层>
+    cargo xtask test-host          # 等价于 cargo test --target x86_64-unknown-linux-gnu -p <纯逻辑层>
 
 目标端（真机在环）测试尚未接线；上机验证当前由 scripts 下的台架流程承担：
-    make check-bench / make flash / make monitor / make bytecheck
+    cargo xtask check-bench / cargo xtask flash / cargo xtask monitor / cargo xtask bytecheck
 MSG
 exit 1

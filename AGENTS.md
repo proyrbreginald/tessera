@@ -45,7 +45,7 @@
 | `cargo xtask trace` | 需求追溯矩阵（生成，勿手改） |
 | `cargo xtask tock-build` / `tock-flash` / `tock-verify` / `tock-sync-boot-header` | Tock（后续固定运行时，迁移中） |
 
-真机命令见 [构建与验证](docs/构建与验证.md)；`make` 只是薄包装，优先用 cargo/xtask。
+真机与交付命令见 [构建与验证](docs/构建与验证.md)；**所有入口统一为 `cargo`/`cargo xtask`，仓库不使用 make**。
 
 ## 4. 代码地图
 
@@ -78,7 +78,7 @@
 - 运行期热替换 capsule / ELF 动态加载；
 - 把 safe capsule 当安全隔离；
 - 为"看起来完成"给未知接口填默认值；
-- 恢复已删除的性能基线门禁（原 bench 子命令与 Makefile 目标，见 [构建与验证](docs/构建与验证.md) §6）。
+- 恢复已删除的性能基线门禁（原 bench 命令，见 [构建与验证](docs/构建与验证.md) §6）。
 
 ## 7. 未实现（别当已解决）
 

@@ -47,11 +47,11 @@ const PURE_CRATES: &[&str] = &[
 
 /// 把 [`PURE_CRATES`] 展开成 `cargo` 的 `-p` 参数序列。
 ///
-/// **这是"纯逻辑 crate 有哪些"的唯一来源**：`verify`、`make test`、
+/// **这是"纯逻辑 crate 有哪些"的唯一来源**：`verify`、`cargo xtask test-host`、
 /// CI 的 clippy/测试步骤全部由它生成，因此新增一个纯逻辑 crate 只需改上面的列表。
 ///
-/// 2026-10-10 的教训：Makefile 与 CI 曾经**各自硬编码**了 5 个 crate，于是在
-/// 纯逻辑层长到 10 个之后，`make test` 仍只跑 144 个用例（门禁口径是 300 个），
+/// 2026-10-10 的教训：早期入口与 CI 曾经**各自硬编码**了 5 个 crate，于是在
+/// 纯逻辑层长到 10 个之后，`cargo xtask test-host` 仍只跑 144 个用例（门禁口径是 300 个），
 /// CI 也漏掉 5 个 crate 的 lint 与测试。同一件事写两遍必然漂移。
 fn pure_package_args() -> Vec<String> {
     let mut args = Vec::new();
@@ -433,7 +433,7 @@ fn check_docs() -> Result<(), String> {
     // 理由：孤儿文档等于不存在 —— 接手者（尤其 Agent）不会去翻目录树，
     // 而这一条**机械可判**，所以不该靠人记得维护索引。
     check_doc_reachability(&root, &mut problems)?;
-    // 文档里出现的每条 `cargo xtask X` / `make X` 都必须真实存在。
+    // 文档里出现的每条 `cargo xtask X` 都必须真实存在。
     check_invocations(&root, &mut problems)?;
     for (file, needle, meaning) in &expectations {
         let document = match read(&root.join(file)) {
@@ -580,13 +580,13 @@ fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// 文档里出现的每条 `cargo xtask X` / `make X` 都必须**真实存在**。
+/// 文档里出现的每条 `cargo xtask X` 都必须**真实存在**；并禁止再引用 `make`。
 ///
 /// 为什么值得断言：文档里的命令是给人（和 Agent）**照抄**的。命令改名或删掉之后，
 /// 文档不会自己更新 —— 而"照着文档敲、报了 command not found"是最伤信任的一类错误。
 /// 反过来它也防止"新命令只活在源码里、文档从不提"。
 fn check_invocations(root: &Path, problems: &mut Vec<String>) -> Result<(), String> {
-    // 1) 文档语料（与可达性检查同一批文件）。
+    // 文档语料：`docs/**/*.md` + 根 README/AGENTS。
     let mut docs: Vec<PathBuf> = Vec::new();
     collect_markdown(&root.join("docs"), &mut docs)?;
     for name in ["README.md", "AGENTS.md"] {
@@ -595,22 +595,7 @@ fn check_invocations(root: &Path, problems: &mut Vec<String>) -> Result<(), Stri
             docs.push(path);
         }
     }
-    // 2) 合法的 `make` 目标：从 Makefile 里抓 `.PHONY:` 与 `^目标:`。
-    let makefile = read(&root.join("Makefile"))?;
-    let mut targets: Vec<String> = Vec::new();
-    for line in makefile.lines() {
-        if let Some(rest) = line.strip_prefix(".PHONY:") {
-            for name in rest.split_whitespace() {
-                targets.push(name.to_string());
-            }
-        } else if line.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_') {
-            if let Some((name, _)) = line.split_once(':') {
-                targets.push(name.trim().to_string());
-            }
-        }
-    }
 
-    // 3) 逐行扫描文档，抽出调用并核对。
     for path in &docs {
         let short = path
             .strip_prefix(root)
@@ -618,47 +603,43 @@ fn check_invocations(root: &Path, problems: &mut Vec<String>) -> Result<(), Stri
             .display()
             .to_string();
         for (number, line) in read(path)?.lines().enumerate() {
-            for (prefix, known) in [
-                // 白名单 = 命令表 + 调度器接受但不在表里的别名（`cargo xtask` 不带参数
-                // 与 `--help`/`-h` 都打印帮助）。别名写在这里而不是命令表里，是因为
-                // 命令表要用于"列出全部子命令"，把 `-h` 列进去只会让人困惑。
-                ("cargo xtask ", &{
-                    let mut known: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
-                    known.extend(["-h", "--help"]);
-                    known
-                }),
-                (
-                    "make ",
-                    &targets.iter().map(String::as_str).collect::<Vec<_>>(),
-                ),
-            ] {
-                let mut rest = line;
-                while let Some(index) = rest.find(prefix) {
-                    let tail = &rest[index + prefix.len()..];
-                    let token: String = tail
-                        .chars()
-                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-                        .collect();
-                    rest = &rest[index + prefix.len()..];
-                    // `cargo xtask` 后面直接换行/结束 = 打印帮助，合法。
-                    // 空 token（`cargo xtask` 后直接结束）与**以 `-` 结尾**的 token
-                    // （文档里的通配写法，如「`check-*` 11 项」）都不是命令名，跳过。
-                    if token.is_empty() || token.ends_with('-') {
-                        continue;
-                    }
-                    if !known.iter().any(|name| **name == token) {
-                        problems.push(format!(
-                            "{short}:{} 引用了不存在的命令 `{prefix}{token}` \
-                             —— 改文档，或把该命令加进 {}",
-                            number + 1,
-                            if prefix.starts_with("cargo") {
-                                "`COMMANDS` 表"
-                            } else {
-                                "Makefile"
-                            }
-                        ));
-                    }
+            // ① 文档里出现的每条 `cargo xtask X` 都必须真实存在。
+            let mut rest = line;
+            while let Some(index) = rest.find("cargo xtask ") {
+                let tail = &rest[index + "cargo xtask ".len()..];
+                let token: String = tail
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+                    .collect();
+                rest = &rest[index + "cargo xtask ".len()..];
+                if token.is_empty() || token.ends_with('-') {
+                    continue;
                 }
+                let known: Vec<&str> = COMMANDS.iter().map(|command| command.name).collect();
+                if !known.iter().any(|name| *name == token) {
+                    problems.push(format!(
+                        "{short}:{} 引用了不存在的命令 `cargo xtask {token}` —— 改文档，或把该命令加进 `COMMANDS` 表",
+                        number + 1
+                    ));
+                }
+            }
+
+            // ② 仓库已统一到 cargo：文档里不得再引用 make 目标。
+            let mut rest = line;
+            while let Some(index) = rest.find("make ") {
+                let tail = &rest[index + "make ".len()..];
+                let token: String = tail
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+                    .collect();
+                rest = &rest[index + "make ".len()..];
+                if token.is_empty() {
+                    continue;
+                }
+                problems.push(format!(
+                    "{short}:{} 引用了 `make {token}` —— 仓库已统一用 cargo，请改成对应的 `cargo xtask ...`",
+                    number + 1
+                ));
             }
         }
     }
@@ -1727,6 +1708,22 @@ fn main() {
         "tock-flash" => tock_flash(),
         "tock-verify" => tock_verify(),
         "tock-sync-boot-header" => tock_sync_boot_header(),
+        "setup" => run_script("scripts/setup-bench.sh", &[], "建 Python 虚拟环境"),
+        "check-bench" => run_script("scripts/check-bench.sh", &[], "台架就绪检查"),
+        "check" => xtask_check(),
+        "evidence" => run_script("scripts/record-evidence.sh", &[], "登记真机证据"),
+        "image" => xtask_image(),
+        "size" => xtask_size(),
+        "objcopy" => xtask_objcopy(),
+        "flash" => run_script("scripts/flash.sh", &[], "烧录固件"),
+        "flash-erase" => run_script("scripts/flash.sh", &["-e", "chip"], "全片擦除并烧录"),
+        "run" => xtask_run(),
+        "bytecheck" => run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验"),
+        "monitor" => run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移"),
+        "soak" => xtask_soak(),
+        "test-target" => xtask_test_target(),
+        "reset" => xtask_reset(),
+        "release-check" => xtask_release_check(),
         "check-compile-fail" => check_compile_fail(),
         "trace" => trace(),
         "verify" => verify(),
@@ -1919,6 +1916,22 @@ const COMMANDS: &[Subcommand] = &[
         what: "从生产固件 ELF 重新生成 Tock 板级 crate 的 8 KiB 启动头（FCB+IVT）",
         check: None,
     },
+    Subcommand { name: "setup", what: "建 Python 虚拟环境（pyocd/pyserial，无需 root）", check: None },
+    Subcommand { name: "check-bench", what: "台架就绪门禁（探针/SWD/pyocd；烧录前必须通过）", check: None },
+    Subcommand { name: "check", what: "静态检查：fmt + 目标/主机 clippy", check: None },
+    Subcommand { name: "evidence", what: "登记一次真机证据到 tmp/evidence/", check: None },
+    Subcommand { name: "image", what: "构建并对 ELF 断言 FCB/IVT/向量表布局", check: None },
+    Subcommand { name: "size", what: "构建并检查固件体积与上限", check: None },
+    Subcommand { name: "objcopy", what: "构建并生成 .bin / .hex 交付物", check: None },
+    Subcommand { name: "flash", what: "烧录（不带全片擦除）", check: None },
+    Subcommand { name: "flash-erase", what: "全片擦除后烧录（改分区/FS 格式后必须）", check: None },
+    Subcommand { name: "run", what: "烧录并抓串口（monitor）", check: None },
+    Subcommand { name: "bytecheck", what: "控制台逐字节校验（改动控制台/时钟后必跑）", check: None },
+    Subcommand { name: "monitor", what: "抓串口并检验时基漂移（±2%）", check: None },
+    Subcommand { name: "soak", what: "长稳采集（--minutes N 可调，默认 30）", check: None },
+    Subcommand { name: "test-target", what: "目标端自检 5 项（需要板子）", check: None },
+    Subcommand { name: "reset", what: "复位目标板", check: None },
+    Subcommand { name: "release-check", what: "发布前检查：verify + coverage + 台架 + bytecheck + monitor", check: None },
 ];
 
 fn print_help() {
@@ -3409,6 +3422,154 @@ fn run(command: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- 台架/交付（包 scripts，入口统一 cargo）
+
+/// 运行仓库内脚本（bash）。入口统一走 `cargo xtask`，脚本只承担台架工具调用。
+fn run_script(script: &str, args: &[&str], what: &str) -> Result<(), String> {
+    let root = workspace_root();
+    let path = root.join(script);
+    if !path.is_file() {
+        return Err(format!("找不到脚本：{script}"));
+    }
+    let status = std::process::Command::new("bash")
+        .arg(&path)
+        .args(args)
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("执行 {what} 失败：{error}"))?;
+    if !status.success() {
+        return Err(format!("{what}失败（见上方输出）"));
+    }
+    println!("[xtask] {what}通过");
+    Ok(())
+}
+
+/// 构建生产固件（release）。
+fn build_firmware() -> Result<(), String> {
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|error| format!("执行 cargo 失败：{error}"))?;
+    if !status.success() {
+        return Err("固件构建失败".to_string());
+    }
+    Ok(())
+}
+
+/// 静态检查：fmt + 目标/主机 clippy。
+fn xtask_check() -> Result<(), String> {
+    run("cargo", &["fmt", "--all", "--check"])?;
+    lint_target()?;
+    lint_host()
+}
+
+/// 构建 + 产物布局断言。
+fn xtask_image() -> Result<(), String> {
+    build_firmware()?;
+    check_image()
+}
+
+/// 构建 + 体积断言。
+fn xtask_size() -> Result<(), String> {
+    build_firmware()?;
+    check_size()
+}
+
+/// 构建 + 生成 `.bin`/`.hex` 交付物（工具链自带 llvm-objcopy）。
+fn xtask_objcopy() -> Result<(), String> {
+    build_firmware()?;
+    let root = workspace_root();
+    let elf = root.join("target/thumbv7em-none-eabihf/release/firmware");
+    let objcopy = llvm_objcopy_path()?;
+    let out_bin = root.join("target/thumbv7em-none-eabihf/release/firmware.bin");
+    let out_hex = root.join("target/thumbv7em-none-eabihf/release/firmware.hex");
+    for (format, out) in [("binary", &out_bin), ("ihex", &out_hex)] {
+        let status = std::process::Command::new(&objcopy)
+            .args(["-O", format])
+            .arg(&elf)
+            .arg(out)
+            .status()
+            .map_err(|error| format!("执行 llvm-objcopy 失败：{error}"))?;
+        if !status.success() {
+            return Err(format!("llvm-objcopy 生成 {format} 失败"));
+        }
+    }
+    println!(
+        "[xtask] objcopy 完成：{} / {}",
+        out_bin.display(),
+        out_hex.display()
+    );
+    Ok(())
+}
+
+/// 烧录 + 抓串口。
+fn xtask_run() -> Result<(), String> {
+    run_script("scripts/flash.sh", &[], "烧录固件")?;
+    run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移")
+}
+
+/// 长稳采集（`--minutes N`，默认 30）。
+fn xtask_soak() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let minutes = args
+        .iter()
+        .skip_while(|argument| *argument != "--minutes")
+        .nth(1)
+        .cloned()
+        .or_else(|| std::env::var("SOAK_MINUTES").ok())
+        .unwrap_or_else(|| "30".to_string());
+    let root = workspace_root();
+    let status = std::process::Command::new(resolve_python())
+        .arg(root.join("scripts/soak.py"))
+        .args(["--minutes", &minutes])
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("执行长稳采集失败：{error}"))?;
+    if !status.success() {
+        return Err("长稳采集失败".to_string());
+    }
+    Ok(())
+}
+
+/// 目标端自检。
+fn xtask_test_target() -> Result<(), String> {
+    let root = workspace_root();
+    let status = std::process::Command::new(resolve_python())
+        .arg(root.join("scripts/target_test.py"))
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("执行目标端自检失败：{error}"))?;
+    if !status.success() {
+        return Err("目标端自检失败".to_string());
+    }
+    Ok(())
+}
+
+/// 复位目标板。
+fn xtask_reset() -> Result<(), String> {
+    let pyocd = resolve_pyocd().ok_or("找不到 pyocd：先跑 `cargo xtask setup`，或设置 PYOCD")?;
+    let status = std::process::Command::new(pyocd)
+        .args(["reset", "--target", "mimxrt1020"])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|error| format!("执行 pyocd reset 失败：{error}"))?;
+    if !status.success() {
+        return Err("复位失败".to_string());
+    }
+    Ok(())
+}
+
+/// 发布前检查：verify + coverage + 台架 + bytecheck + monitor。
+fn xtask_release_check() -> Result<(), String> {
+    verify()?;
+    coverage()?;
+    run_script("scripts/check-bench.sh", &[], "台架就绪检查")?;
+    run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验")?;
+    xtask_reset()?;
+    run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移")
+}
+
 // ---------------------------------------------------------------- Tock（固定运行时；迁移中）
 
 /// 板级 crate 目录（作为 cargo 工作目录，才能取到板级 `.cargo/config.toml`）。
@@ -3531,6 +3692,31 @@ fn tock_verify() -> Result<(), String> {
 }
 
 
+/// 工具链自带 `llvm-objcopy` 的路径（需要 `llvm-tools` 组件）。
+fn llvm_objcopy_path() -> Result<PathBuf, String> {
+    let sysroot = String::from_utf8(
+        std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .map_err(|error| format!("执行 rustc 失败：{error}"))?
+            .stdout,
+    )
+    .map_err(|error| format!("rustc sysroot 不是 UTF-8：{error}"))?
+    .trim()
+    .to_string();
+    let rustlib = Path::new(&sysroot).join("lib/rustlib");
+    for entry in fs::read_dir(&rustlib).map_err(|error| error.to_string())? {
+        let candidate = entry
+            .map_err(|error| error.to_string())?
+            .path()
+            .join("bin/llvm-objcopy");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err("工具链里找不到 llvm-objcopy（需要 llvm-tools 组件）".to_string())
+}
+
 /// 从生产固件 ELF 同步 Tock 板级 crate 的 8 KiB 启动头（FCB + IVT）。
 ///
 /// 为什么需要它：`boot_hdr.bin` 是**构建输入源文件**（不是构建产物），
@@ -3553,29 +3739,7 @@ fn tock_sync_boot_header() -> Result<(), String> {
     }
 
     // 2) 找工具链自带的 llvm-objcopy（与 `check-*` 门禁同一来源，不依赖 PATH）。
-    let sysroot = String::from_utf8(
-        std::process::Command::new("rustc")
-            .args(["--print", "sysroot"])
-            .output()
-            .map_err(|error| format!("执行 rustc 失败：{error}"))?
-            .stdout,
-    )
-    .map_err(|error| format!("rustc sysroot 不是 UTF-8：{error}"))?
-    .trim()
-    .to_string();
-    let rustlib = Path::new(&sysroot).join("lib/rustlib");
-    let mut objcopy: Option<PathBuf> = None;
-    for entry in fs::read_dir(&rustlib).map_err(|error| error.to_string())? {
-        let candidate = entry
-            .map_err(|error| error.to_string())?
-            .path()
-            .join("bin/llvm-objcopy");
-        if candidate.is_file() {
-            objcopy = Some(candidate);
-            break;
-        }
-    }
-    let objcopy = objcopy.ok_or("工具链里找不到 llvm-objcopy（需要 llvm-tools 组件）")?;
+    let objcopy = llvm_objcopy_path()?;
 
     // 3) ELF → 二进制，取前 8192 B。
     let tmp_dir = root.join("tmp");

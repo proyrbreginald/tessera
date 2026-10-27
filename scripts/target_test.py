@@ -6,7 +6,7 @@
 - 主机只负责复位、发送、抓取、解析、退出码。
 
 用法：
-    make test-target
+    cargo xtask test-target
     .venv/bin/python scripts/target_test.py --timeout 60
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from datetime import datetime
 try:
     import serial  # type: ignore
 except ImportError:
-    print("缺少 pyserial：make setup", file=sys.stderr)
+    print("缺少 pyserial：cargo xtask setup", file=sys.stderr)
     raise SystemExit(2)
 
 TEST_LINE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\s*$")

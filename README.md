@@ -22,8 +22,8 @@ cargo xtask context         # 机器可读项目上下文（crate/门禁/缺口/
 ```bash
 bash scripts/flash.sh -e chip   # 全片擦除 + 烧录（改分区/FS 格式后必须）
 bash scripts/read_console.py --seconds 5   # 看串口
-make bytecheck                  # 控制台逐字节校验（改时钟/中断后必跑）
-make test-target                # 目标端自检 5 项
+cargo xtask bytecheck                  # 控制台逐字节校验（改时钟/中断后必跑）
+cargo xtask test-target                # 目标端自检 5 项
 ```
 
 ## 仓库结构
@@ -37,7 +37,7 @@ xtask/        构建与门禁（Rust，独立工作区；不是成员 crate）
 tests/        主机集成测试与编译失败负例
 ```
 
-> 原来的 `bench/`（真机性能基线）与 Makefile 的 `bench` 目标已删除：
+> 原来的 `bench/`（真机性能基线）与对应命令已删除：
 > 测量受缓存/温度影响大、维护成本高于收益；真机事实改由启动横幅回读 +
 > `bytecheck`/`test-target`/`monitor` 提供。
 
