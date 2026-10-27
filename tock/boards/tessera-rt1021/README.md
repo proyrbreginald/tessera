@@ -21,7 +21,7 @@ cargo xtask tock-build
 ```
 
 - 工具链：stable `rustc 1.99.1 (58cf8f9c3 2026-10-13)`，target `thumbv7em-none-eabihf`。
-- 产出：`runtime/tock/target/thumbv7em-none-eabihf/release/tessera-rt1021`
+- 产出：`tock/target/thumbv7em-none-eabihf/release/tessera-rt1021`
 - 注意：**不要**用 nightly。Tock 默认配置里的 `-Z emit-stack-sizes` / `build-std`
   是 nightly-only，本板 `.cargo/config.toml` 已改为 stable 兼容的 flags。
 
@@ -149,7 +149,7 @@ RX 中断、又没有挂接收缓冲 → 硬件 `RDRF`/`OR` 溢出，后面的�
 
 ## 6. 在仓库中的位置与维护约定
 
-- 本 crate 位于 `runtime/tock/boards/tessera-rt1021/`，是 vendored Tock 工作区里
+- 本 crate 位于 `tock/boards/tessera-rt1021/`，是 vendored Tock 工作区里
   **唯一由本仓库维护**的目录；其余 `kernel/ arch/ chips/ libraries/ boards/build_scripts`
   都是上游 Tock 2.3.0 的裁剪副本。
 - 对上游的改动只有 `patches/` 里的 2 个补丁（4 处 `TESSERA-PATCH`），vendored 源码已应用；

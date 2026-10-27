@@ -30,7 +30,7 @@ make test-target                # 目标端自检 5 项
 
 ```text
 crates/       生产固件 + 纯逻辑层：20 个成员 crate（18 个纯逻辑，可主机测试）
-runtime/      备选运行时（vendored Tock 2.3.0 裁剪版，不参与生产构建）
+tock/         后续固定运行时（vendored Tock 2.3.0 裁剪版 + 本地板级 crate）
 docs/         核心文档（重构后的精简版）
 scripts/      台架/烧录/抓包脚本（bash）
 xtask/        构建与门禁（Rust，独立工作区；不是成员 crate）
@@ -49,7 +49,7 @@ tests/        主机集成测试与编译失败负例
 | 工作区成员 crate | 20（18 个纯逻辑） |
 | 静态门禁        18 项子命令 | `cargo xtask gates` 逐条查看 |
 | 未实现缺口 | 3（P2 CAN 外部接收、P4 Bootloader、P5 看门狗） |
-| Tock 备选运行时 | 已入仓并真机验证启动/串口；**生产仍是 RTIC** |
+| Tock 运行时 | **后续固定采用，不再替换**；已真机验证启动/串口；当前生产仍是 RTIC，迁移中 |
 
 会漂移的测量值（主机测试数、覆盖率、映像字节数）不写死在这里：
 用 `cargo xtask context` 获取。
@@ -64,7 +64,7 @@ tests/        主机集成测试与编译失败负例
 | [构建与验证](docs/构建与验证.md) | 全部 cargo/台架命令、门禁清单、排障 |
 | [安全与约束](docs/安全与约束.md) | unsafe 预算、fail-closed、安全门控、缺口 |
 | [业务接入](docs/业务接入.md) | capsule SDK/端口契约、仓库外业务 crate |
-| [Tock 运行时](docs/Tock运行时.md) | vendored Tock 的构建/烧录/限制 |
+| [Tock 运行时](docs/Tock运行时.md) | 固定运行时（迁移中）：构建/烧录/限制 |
 | [Flash 布局](docs/02-架构/Flash布局与用途划分.md) · [分层规则](docs/02-架构/分层与依赖规则.md) | 分区表与依赖边界（门禁核对） |
 | [需求规格](docs/01-需求/需求规格.md) | 30 条平台需求（`cargo xtask trace` 生成追溯矩阵） |
 

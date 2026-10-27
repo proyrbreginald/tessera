@@ -1901,7 +1901,7 @@ const COMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "tock-build",
-        what: "构建 runtime/tock 下的最小 Tock 镜像（实验性，不参与生产固件）",
+        what: "构建 tock/ 下的 Tock 镜像（后续固定运行时；不参与当前生产固件）",
         check: None,
     },
     Subcommand {
@@ -3409,12 +3409,12 @@ fn run(command: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- Tock（实验性）
+// ---------------------------------------------------------------- Tock（固定运行时；迁移中）
 
 /// 板级 crate 目录（作为 cargo 工作目录，才能取到板级 `.cargo/config.toml`）。
-const TOCK_BOARD_DIR: &str = "runtime/tock/boards/tessera-rt1021";
+const TOCK_BOARD_DIR: &str = "tock/boards/tessera-rt1021";
 /// 构建产物（cargo 工作区 target 目录）。
-const TOCK_ELF: &str = "runtime/tock/target/thumbv7em-none-eabihf/release/tessera-rt1021";
+const TOCK_ELF: &str = "tock/target/thumbv7em-none-eabihf/release/tessera-rt1021";
 
 /// 构建最小 Tock 镜像（`cargo build --release`，不用 make/脚本）。
 fn tock_build() -> Result<(), String> {
@@ -3422,7 +3422,7 @@ fn tock_build() -> Result<(), String> {
     let board = root.join(TOCK_BOARD_DIR);
     if !board.join("Cargo.toml").is_file() {
         return Err(format!(
-            "找不到 Tock 板级 crate：{}（runtime/tock 未入仓？）",
+            "找不到 Tock 板级 crate：{}（tock/ 未入仓？）",
             board.display()
         ));
     }
@@ -3615,7 +3615,7 @@ fn tock_sync_boot_header() -> Result<(), String> {
             "IVT 自检失败：magic={ivt_magic:#010x} entry={ivt_entry:#010x}（期望 0x402000d1 / 0x60002000）"
         ));
     }
-    let target = root.join("runtime/tock/boards/tessera-rt1021/boot_hdr.bin");
+    let target = root.join("tock/boards/tessera-rt1021/boot_hdr.bin");
     fs::write(&target, header).map_err(|error| error.to_string())?;
     println!(
         "[xtask] tock-sync-boot-header 完成：{}（FCB + IVT entry=0x60002000）",

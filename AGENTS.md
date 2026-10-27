@@ -43,7 +43,7 @@
 | `cargo xtask check-fault-handlers` / `check-critical` / `check-compile-fail` | 故障向量 / 关中断入口 / 编译负例 |
 | `cargo xtask check-style` / `check-lint-headers` / `check-api-usage` / `check-gaps` | 风格 / lint 头 / 公开项 / 缺口 |
 | `cargo xtask trace` | 需求追溯矩阵（生成，勿手改） |
-| `cargo xtask tock-build` / `tock-flash` / `tock-verify` / `tock-sync-boot-header` | Tock 备选运行时（实验性） |
+| `cargo xtask tock-build` / `tock-flash` / `tock-verify` / `tock-sync-boot-header` | Tock（后续固定运行时，迁移中） |
 
 真机命令见 [构建与验证](docs/构建与验证.md)；`make` 只是薄包装，优先用 cargo/xtask。
 

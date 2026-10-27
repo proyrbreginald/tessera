@@ -3,13 +3,13 @@
 # xtask 是**独立工作区**（不是成员），它的产物目录不在上面的 `/target` 里。
 /xtask/target
 # vendored Tock 工作区的构建产物
-/runtime/tock/target
+/tock/target
 
 /.venv
 /tmp
 *.bin
 # Tock 板级 crate 的启动头是**源文件**（从生产固件同步而来），必须入库：
-!runtime/tock/boards/tessera-rt1021/boot_hdr.bin
+!tock/boards/tessera-rt1021/boot_hdr.bin
 *.hex
 *.elf
 *.map

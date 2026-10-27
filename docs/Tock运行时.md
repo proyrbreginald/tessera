@@ -1,12 +1,12 @@
-# Tock 运行时（实验性）
+# Tock 运行时
 
-> 结论：**Tock 2.3.0 已入仓并可用 cargo 构建/烧录/验证**，但只是备选运行时；
-> 生产固件仍是 RTIC（`crates/firmware`，`VERSION` 不变）。源码在 `runtime/tock/`。
+> **Tock 是后续固定运行时（已确定采用，不再选型/不会替换）**，源码在顶层 `tock/`。
+> 当前生产固件仍是 RTIC；迁移按本文 §4 的前置条件推进，完成前不以 Tock 替换生产入口。
 
 ## 1. 目录
 
 ```text
-runtime/tock/
+tock/
   kernel/ arch/ chips/ libraries/ boards/build_scripts/  # vendored 上游 2.3.0（裁剪）
   boards/tessera-rt1021/   # ★ 唯一本地维护的板级 crate
   patches/                 # 对上游的 2 个补丁（lpuart 4 处）
@@ -34,7 +34,7 @@ tock: kernel_loop running (echo mode)
 tock: rx line(11B): TOCK-VERIFY
 ```
 
-## 3. 已知限制（不能当替换完成）
+## 3. 当前差距（迁移完成前必须补齐）
 
 1. **连续输入丢字节**：LPUART RX FIFO 仅 1 B + Tock 逐字节回调；逐字节/按行正确，
    流水线连续多行约每 3 字节丢 1。需补 RX 环形队列/中断驱动 TX/DMA。
@@ -47,6 +47,6 @@ tock: rx line(11B): TOCK-VERIFY
 RX/TX 队列 → capsule/进程迁移 → 时基/调度语义 → BSP 迁移 → 重新建立等价门禁
 （`cargo xtask verify` + 真机 `bytecheck`/`test-target`）后，才谈切换 `crates/firmware`。
 
-维护约定与升级步骤见 [`runtime/README.md`](../runtime/README.md)、
-[`runtime/tock/README.md`](../runtime/tock/README.md)、
-[`runtime/tock/LOCAL_PATCHES.md`](../runtime/tock/LOCAL_PATCHES.md)。
+维护约定与升级步骤见 [`tock/README.md`](../tock/README.md)、
+[`tock/README.md`](../tock/README.md)、
+[`tock/LOCAL_PATCHES.md`](../tock/LOCAL_PATCHES.md)。

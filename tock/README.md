@@ -1,7 +1,9 @@
-# runtime/tock —— 裁剪后的 Tock 2.3.0（实验性运行时）
+# tock —— Tessera 的固定运行时（vendored Tock 2.3.0）
 
-> 本目录是 **vendored 上游源码 + 唯一本地板级 crate**，不是 Tessera 生产固件，
-> 也不属于 Tessera 的 cargo workspace。维护约定：
+> **Tock 是后续固定运行时（已确定采用，不做运行时选型/不会被替换）**。
+> 本目录是 **vendored 上游源码 + 唯一本地板级 crate**；它不属于 Tessera 的 cargo
+> workspace（Tock 有自己的 workspace），当前生产固件仍用 RTIC，迁移按
+> `docs/Tock运行时.md` 的前置条件推进。维护约定：
 >
 > - `kernel/ arch/ chips/ libraries/ boards/build_scripts/`：**vendored 上游 Tock 2.3.0**，
 >   只保留本板需要的子集；不要在这里做业务改动，升级时整体替换；
@@ -21,7 +23,7 @@
 
 
 > **状态：验证已通过，不是生产替换。** 生产固件仍是 RTIC（`crates/firmware`，`VERSION` 0.1.2.0）。
-> 本目录（`runtime/tock`）只是一次**技术可行性验证**：把 Tessera 的固件入口换成 Tock 2.3.0 内核，
+> 本次落地已完成**最小真机验证**（启动/中断驱动串口回显）：把 Tessera 的固件入口换成 Tock 2.3.0 内核，
 > 复用现有 Flash 布局与启动头（FCB/IVT），在真实板卡上跑通「启动 + 中断驱动串口回显」。
 
 ## 1. 结论（事实）
@@ -58,7 +60,7 @@ Tock 的逐字节回调模型没有 RX 环形队列。逐字节/按行发送时�
 
 ```bash
 # 仓库根目录执行（工具链为仓库 stable）：
-cargo xtask tock-build     # 产物：runtime/tock/target/thumbv7em-none-eabihf/release/tessera-rt1021
+cargo xtask tock-build     # 产物：tock/target/thumbv7em-none-eabihf/release/tessera-rt1021
 cargo xtask tock-flash     # 全片擦除后烧录
 cargo xtask tock-verify    # 烧录并验证启动横幅 + 行回显
 ```
