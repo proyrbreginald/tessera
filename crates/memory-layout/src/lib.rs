@@ -52,11 +52,11 @@
 //!
 //! | 常量 | 值 | 依据 |
 //! |---|---|---|
-//! | [`ITCM`] / [`DTCM`] / [`OCRAM`] | `0x0000_0000` 64 KiB、`0x2000_0000` 64 KiB、`0x2020_0000` 128 KiB | FlexRAM 8 bank × 32 KB 的默认（全零熔丝）划分，与 `imxrt-rt` 的 `Family::Imxrt1020` 链接脚本一致；`docs/02-架构/内存与Flash布局.md` |
-//! | [`FLASH_XIP`] | `0x6000_0000` 32 MiB | 实装 `W25Q256JVEQ`；`docs/03-硬件/板级事实.md` |
-//! | [`SDRAM`] | `0x8000_0000` 32 MiB | 实装 `W9825G6KH-6I`（SEMC CS0）；`docs/03-硬件/板级事实.md` |
+//! | [`ITCM`] / [`DTCM`] / [`OCRAM`] | `0x0000_0000` 64 KiB、`0x2000_0000` 64 KiB、`0x2020_0000` 128 KiB | FlexRAM 8 bank × 32 KB 的默认（全零熔丝）划分，与 `imxrt-rt` 的 `Family::Imxrt1020` 链接脚本一致；`docs/硬件与板级事实.md` |
+//! | [`FLASH_XIP`] | `0x6000_0000` 32 MiB | 实装 `W25Q256JVEQ`；`docs/硬件与板级事实.md` |
+//! | [`SDRAM`] | `0x8000_0000` 32 MiB | 实装 `W9825G6KH-6I`（SEMC CS0）；`docs/硬件与板级事实.md` |
 //! | [`STACK_SIZE`] | 48 KiB | 被真机打穿三次（8 / 16 / 32 KiB）之后的**实测**值；唯一真源是 `crates/firmware/build.rs` 的 `STACK_BYTES` |
-//! | [`ITCM_CODE_BUDGET_BYTES`] | 64 KiB | `docs/02-架构/资源利用与优化评审.md` §3.2：`.text` 落在 ITCM 且不超 64 KiB（按用户要求取消 8 KiB 预留） |
+//! | [`ITCM_CODE_BUDGET_BYTES`] | 64 KiB | `docs/架构与实现.md` §3.2：`.text` 落在 ITCM 且不超 64 KiB（按用户要求取消 8 KiB 预留） |
 
 #![no_std]
 // 纯数据与算术：本 crate 存在的意义之一就是能被主机上的门禁遍历。
@@ -427,8 +427,8 @@ pub fn headroom_bytes(words: &[u32], pattern: u32) -> usize {
 
 /// 栈余量阈值（百分比）：低于它就算不达标。
 ///
-/// 30% 是 `docs/02-架构/资源利用与优化评审.md` §3.2 建议的门禁值，也是
-/// `docs/04-开发/测试策略.md` §1.6 的判据（"栈高水位：栈填充 + 检查，余量 ≥ 30%"）。
+/// 30% 是 `docs/架构与实现.md` §3.2 建议的门禁值，也是
+/// `docs/构建与验证.md` §1.6 的判据（"栈高水位：栈填充 + 检查，余量 ≥ 30%"）。
 /// 当前实测峰值 29,860 B / 48 KiB，余量 39%（2026-10-13；bench 基线记 34%）。
 pub const MIN_STACK_HEADROOM_PERCENT: u32 = 30;
 
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn layout_matches_the_documented_board_map() {
-        // 期望值直接照 `docs/02-架构/内存与Flash布局.md` 与 `docs/03-硬件/板级事实.md`
+        // 期望值直接照 `docs/硬件与板级事实.md` 与 `docs/硬件与板级事实.md`
         // 抄写，不调用本 crate 的其它函数来"互相印证"。
         assert_eq!(ITCM.base, 0x0000_0000);
         assert_eq!(ITCM.size, 64 * 1024);

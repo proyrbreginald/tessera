@@ -159,24 +159,24 @@ RX 中断、又没有挂接收缓冲 → 硬件 `RDRF`/`OR` 溢出，后面的�
 
 ## 7. `boot_hdr.bin` 的来源（可复现）
 
-`boot_hdr.bin` = **现有生产固件**（Tessera 0.1.1.0，RTIC）链接产物 `firmware` 的
+`boot_hdr.bin` = **现有生产固件**（Tessera 0.1.2.0，RTIC）链接产物 `firmware` 的
 原始二进制映像的**前 8192 字节**（FCB + IVT + boot data 所在的 8 KiB 启动头）。
 生成命令（本机已实测 `cmp` 与当前 `boot_hdr.bin` 逐字节一致）：
 
 ```bash
-# 在 Tessera 仓库根目录（VERSION = 0.1.1.0）
+# 在 Tessera 仓库根目录（VERSION = 0.1.2.0）
 cargo build --release
 ELF=target/thumbv7em-none-eabihf/release/firmware
 LLVM_BIN="$(RUSTUP_TOOLCHAIN=stable rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin"
-"$LLVM_BIN/llvm-objcopy" -O binary "$ELF" /tmp/tessera-fw-0.1.1.0.bin
-head -c 8192 /tmp/tessera-fw-0.1.1.0.bin > boards/tessera-rt1021/boot_hdr.bin
+"$LLVM_BIN/llvm-objcopy" -O binary "$ELF" /tmp/tessera-fw-0.1.2.0.bin
+head -c 8192 /tmp/tessera-fw-0.1.2.0.bin > boards/tessera-rt1021/boot_hdr.bin
 # 自检：前 4 字节应为 FCFB，且大小恰好 8192
 od -A x -t x1z -N 4 boards/tessera-rt1021/boot_hdr.bin
 stat -c '%s' boards/tessera-rt1021/boot_hdr.bin
 ```
 
 说明：`firmware` ELF 本身约 2.85 MB（含 debug），`llvm-objcopy -O binary` 后是
-184,760 B（0.1.1.0），取前 8 KiB 即得该头。文件内容**不要手改**：它是 Boot ROM
+184,760 B（0.1.2.0），取前 8 KiB 即得该头。文件内容**不要手改**：它是 Boot ROM
 读取的 FCB + IVT，写坏 = 只能靠 BOOT_MODE 引脚救砖。
 
 ## 8. 还没确定 / 需要在真机上确认的点

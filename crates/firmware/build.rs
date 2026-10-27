@@ -3,7 +3,7 @@
 //! `imxrt-rt` 的构建期 API 按这里描述的内存映射生成链接脚本（`imxrt-link.x`），
 //! 并在映像作为可启动 flash 映像构建时注入启动头（FCB 槽位 + IVT + boot data）。
 //!
-//! 本文件里每个数值都能追到 `docs/03-硬件/板级事实.md` 的证据链。
+//! 本文件里每个数值都能追到 `docs/硬件与板级事实.md` 的证据链。
 //! 两个"文本真源"在仓库根：`VERSION`（版本号）与 `banner.txt`（启动横幅）。
 
 use std::env;
@@ -60,7 +60,7 @@ fn main() {
     //
     // DTCM 共 64 KiB，`imxrt-rt` 把栈放在最底部（`0x20000000` 起）、向量表紧随其后，
     // 其余大部分本来是空的 —— 因此这里增大栈几乎不占别的资源。
-    // 若将来要缩小，先看 `docs/04-开发/测试策略.md` 里"栈余量"那条：它要求先有**测量**，
+    // 若将来要缩小，先看 `docs/构建与验证.md` 里"栈余量"那条：它要求先有**测量**，
     // 而不是先有数字。
     let mut runtime =
         imxrt_rt::RuntimeBuilder::from_flexspi(imxrt_rt::Family::Imxrt1020, FLASH_SIZE);

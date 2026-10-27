@@ -56,14 +56,6 @@ coverage: ## 主机侧覆盖率（阈值 90%）
 context: ## 机器可读的项目上下文（JSON，供 Agent/脚本用）
 	cargo xtask context
 
-.PHONY: bench
-bench: ## 真机基准与基线回归（需要台架）
-	cargo xtask bench
-
-.PHONY: bench-record
-bench-record: ## 重新采集真机基准基线
-	cargo xtask bench --record
-
 .PHONY: verify
 verify: ## 全量离线验证（门禁 + lint + 测试 + 构建 + 产物断言）
 	@bash scripts/verify.sh
@@ -73,14 +65,13 @@ evidence: ## 登记一次真机证据（版本/镜像/板卡/抓包）到 tmp/ev
 	@bash scripts/record-evidence.sh
 
 .PHONY: release-check
-release-check: verify ## 发布前检查：verify + 覆盖率 + 台架门禁 + bytecheck + monitor + bench
+release-check: verify ## 发布前检查：verify + 覆盖率 + 台架门禁 + bytecheck + monitor
 	cargo xtask coverage
 	@bash scripts/check-bench.sh
 	@bash scripts/bytecheck.sh
 	@.venv/bin/pyocd reset -t mimxrt1020
 	@sleep 1
 	@bash scripts/monitor.sh
-	cargo xtask bench
 
 .PHONY: image
 image: build ## 对链接后的 ELF 断言 FCB/IVT/向量表布局

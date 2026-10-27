@@ -18,5 +18,5 @@ runtime/
 
 - 构建/烧录/验证统一走 `cargo xtask`（Rust，不依赖 make）：
   `cargo xtask tock-build` / `cargo xtask tock-flash` / `cargo xtask tock-verify`
-- 设计记录：[`docs/02-架构/Tock替换RTIC验证.md`](../docs/02-架构/Tock替换RTIC验证.md)
+- 设计记录：[`docs/Tock运行时.md`](../docs/Tock运行时.md)
 - 模板/细节：[`runtime/tock/boards/tessera-rt1021/README.md`](tock/boards/tessera-rt1021/README.md)

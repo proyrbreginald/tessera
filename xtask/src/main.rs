@@ -1025,7 +1025,7 @@ fn gates() -> Result<(), String> {
 ///
 /// 测试函数名**允许中文**：本仓库全中文，`cargo test` 的输出是给人看的
 /// （109 个测试函数如此，强行改名只会制造噪音）。非测试标识符仍为 ASCII —— 这条
-/// 无法机械判定，因此写在 [`docs/04-开发/代码风格.md`] 里靠评审保证。
+/// 无法机械判定，因此写在 [`docs/构建与验证.md`] 里靠评审保证。
 fn check_style() -> Result<(), String> {
     let root = workspace_root();
     let mut violations: Vec<String> = Vec::new();
@@ -1249,316 +1249,12 @@ fn context() -> Result<(), String> {
         "  \"measured\": {{\"host_tests\": {host_tests}, \"coverage\": {coverage_summary}, \"note\": \"null 表示本次会话尚未运行对应命令，不是 0\"}},\n"
     ));
 
-    // 真机基准：有基线文件就带出来（没有就为 null，表示"尚未采集"）。
-    let baseline = root.join(BENCH_BASELINE);
-    let bench = fs::read_to_string(&baseline).unwrap_or_else(|_| "null".to_string());
-    out.push_str(&format!("  \"bench_baseline\": {},\n", bench.trim()));
     out.push_str("  \"exit_code_contract\": \"门禁命令 0 = 通过，非 0 = 失败；原因在最后一行 [xtask] 输出里。要一次看全部静态门禁的结果，用 `cargo xtask gates`（不因第一个失败而中断）\"\n");
     out.push_str("}\n");
     // 先自检再输出：宁可让 `context` 失败，也不要吐出一份"看起来正常"的坏 JSON。
     validate_json(&out)?;
     print!("{out}");
     Ok(())
-}
-
-/// 真机基准文件（提交进仓库，作为回归基线）。
-const BENCH_BASELINE: &str = "bench/baseline.json";
-/// 允许的回归幅度（百分比）：超过它 `xtask bench` 失败。
-const BENCH_TOLERANCE_PERCENT: u32 = 25;
-
-/// 一条基准指标。
-struct Metric {
-    /// 串口输出里用于取数的标签。
-    label: &'static str,
-    /// 从一行里抽出的数值。
-    parse: fn(&str) -> Option<u64>,
-    /// 越大越好（吞吐）还是越小越好（耗时）。
-    higher_is_better: bool,
-    /// **绝对容差**：变化量小于它就一律不算回归。
-    ///
-    /// 为什么光有百分比不够：毫秒级指标的抖动幅度很小，百分比却可以很大
-    /// （挂载 3 ms → 5 ms 是 +67%），那会让门禁变成"随机报警器"。
-    /// 判据是"百分比与绝对量**同时**超限才算回归"。
-    min_absolute_delta: u64,
-    /// **硬下限**：`Some(v)` 表示这条指标不是"相对基线"而是"绝对要求"
-    /// （低于 `v` 直接失败，与基线无关）。
-    ///
-    /// 用它把文档里的阈值变成可执行的判据 —— 例如栈余量下限来自
-    /// [`memory_layout::MIN_STACK_HEADROOM_PERCENT`]，不再只是文档里的数字。
-    minimum: Option<u64>,
-    /// **物理上限**：`Some(v)` 表示"大于 `v` 不是更好，而是测量方法可疑"。
-    ///
-    /// 2026-10-19 真机校准：flash 读吞吐测出 3,401,993 KiB/s（基线 48,701），
-    /// `bench` 当成"改善 6885% 通过"—— 实际是缓存命中，不是器件带宽。
-    /// 对这类指标，超过物理上限必须失败，而不是奖励。
-    maximum: Option<u64>,
-}
-
-/// 采集的指标集合。**只放"能稳定复现"的量**：吞吐与耗时会随板子状态波动，
-/// 因此留 25% 容差；容差之内不算回归，超出就说明有实质变化。
-const METRICS: &[Metric] = &[
-    Metric {
-        label: "flash 读吞吐（KiB/s）",
-        // 用「在行内找标记」而不是「行首精确匹配」：抓包常有粘行/前缀噪声，
-        // 严格匹配会让门禁在数据其实存在时报"找不到"。
-        parse: |line| {
-            let rest = line.split("flash rd : ").nth(1)?;
-            rest.split_whitespace().next()?.parse().ok()
-        },
-        higher_is_better: true,
-        // 2000 KiB/s ≈ 基线（约 50 MiB/s）的 4%，小于它说明只是测量抖动。
-        min_absolute_delta: 2000,
-        minimum: None,
-        maximum: Some(200_000),
-    },
-    Metric {
-        label: "文件系统挂载（ms）",
-        parse: |line| {
-            let rest = line.split("filesystem : ").nth(1)?;
-            rest.split(|ch: char| !ch.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()
-        },
-        higher_is_better: false,
-        min_absolute_delta: 20,
-        minimum: None,
-        maximum: None,
-    },
-    Metric {
-        label: "SDRAM 全片自检（ms）",
-        parse: |line| {
-            let rest = line.split("sdram post : ").nth(1)?;
-            rest.split(|ch: char| !ch.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()
-        },
-        higher_is_better: false,
-        min_absolute_delta: 200,
-        minimum: None,
-        maximum: None,
-    },
-    Metric {
-        // 启动报告：`  stack      : peak N B / 48 KiB · headroom M B (P%)`
-        label: "栈余量（%）",
-        parse: |line| {
-            let rest = line.split("headroom ").nth(1)?;
-            let percent = rest.split('(').nth(1)?;
-            percent.split('%').next()?.trim().parse().ok()
-        },
-        higher_is_better: true,
-        min_absolute_delta: 0,
-        // 硬下限：把"栈余量不得低于 30%"从文档变成真机门禁。
-        minimum: Some(memory_layout::MIN_STACK_HEADROOM_PERCENT as u64),
-        maximum: None,
-    },
-    Metric {
-        // 固件心跳行：`beat=… rt=ok|VIOLATION`。
-        //
-        // ⚠️ 这一条补的是**我自己留下的空头承诺**：`report_beat` 的注释早就写着
-        // "`cargo xtask bench` 会把这一列当作硬判据"，而 METRICS 里根本没有它
-        // （审计点名："现在这句注释是空头承诺"）。注释说了不算，判据说了才算。
-        //
-        // 编码成 1/0 而不是直接用文本：`minimum: Some(1)` 就是"必须成立"，
-        // 与基线无关（实时预算不该有"比上次慢一点也算过"的余地）。
-        label: "实时预算成立（1=ok / 0=VIOLATION|none）",
-        parse: |line| {
-            // `rt=none`（一次都没测过）**必须**记 0：把"没在测"当成"合格"是这个项目
-            // 最忌讳的失效方式，2026-10-12 真机上真的踩到过。
-            if line.contains("rt=ok") {
-                Some(1)
-            } else if line.contains("rt=VIOLATION") || line.contains("rt=none") {
-                Some(0)
-            } else {
-                None
-            }
-        },
-        higher_is_better: true,
-        min_absolute_delta: 0,
-        minimum: Some(1),
-        maximum: None,
-    },
-    Metric {
-        // 固件心跳行：`… txdrop=N …`（因"队满且中断关着"而丢弃的控制台字节数）。
-        //
-        // 同样编码成 1/0：**只要丢过就是异常**（正常运行时队列不会满）。
-        // 这一条把"关中断里输出超过队列容量"从"日志偶尔少几行"变成可判定的失败。
-        label: "控制台无丢弃（1=txdrop 0 / 0=丢过）",
-        parse: |line| {
-            let rest = line.split("txdrop=").nth(1)?;
-            let value: u32 = rest
-                .split(|ch: char| !ch.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()?;
-            Some(u64::from(u8::from(value == 0)))
-        },
-        higher_is_better: true,
-        min_absolute_delta: 0,
-        minimum: Some(1),
-        maximum: None,
-    },
-];
-
-/// 真机基准：`--record` 覆盖基线，默认与基线比对。
-///
-/// 需要台架（调试器 + 串口）。采集方式：复位板子并抓取启动输出，从**固件自报**的
-/// 行里取数 —— 与门禁的"报事实"原则一致：基准来自固件打印的事实，不是主机侧估算。
-fn bench() -> Result<(), String> {
-    let record = std::env::args().any(|argument| argument == "--record");
-    let serial_path =
-        std::env::var("BASE_SERIAL").unwrap_or_else(|_| "/dev/pudu-debugger-16p-uart".to_string());
-    // `--from-file <抓包>`：用**已有的抓包**跑解析与比对，不需要台架。
-    // 没有它，"解析对不对"就只能等板子空闲时才能发现 —— 而解析一旦写错，
-    // 基准门禁会给出错误结论（比没有门禁更糟）。抓包文件同样可用于回归留档。
-    let from_file = std::env::args()
-        .skip_while(|argument| argument != "--from-file")
-        .nth(1);
-    let capture = match from_file {
-        Some(path) => {
-            println!("[xtask] bench：从抓包文件 {path} 取数（不接触台架）");
-            // 抓包里可能有被链路吃掉半个字节留下的非 UTF-8 序列（那正是要诊断的现象），
-            // 因此**有损解码**而不是拒绝整个文件。
-            let bytes = fs::read(&path).map_err(|error| format!("读抓包失败：{error}"))?;
-            String::from_utf8_lossy(&bytes).to_string()
-        }
-        None => {
-            // 只有真要连台架时才检查串口是否存在（`--from-file` 不需要台架）。
-            if !Path::new(&serial_path).exists() {
-                return Err(format!(
-                    "串口 {serial_path} 不存在：`xtask bench` 需要台架。\
-                     可用 BASE_SERIAL=<节点> 覆盖，或用 `--from-file <抓包>` 离线取数；\
-                     先跑 `make check-bench` 确认台架就绪。"
-                ));
-            }
-            println!("[xtask] bench：从 {serial_path} 采集（复位板子，抓 20 秒启动输出）…");
-            capture_boot_output(&serial_path, 20)?
-        }
-    };
-    let mut measured: Vec<(&'static str, u64)> = Vec::new();
-    for metric in METRICS {
-        let value = capture
-            .lines()
-            .find_map(|line| (metric.parse)(line.trim()))
-            .ok_or_else(|| {
-                format!(
-                    "没有在启动输出里找到「{}」。\
-                     确认固件版本包含该行（`cargo xtask check-image` 通过后再烧录）。",
-                    metric.label
-                )
-            })?;
-        println!("  {} = {value}", metric.label);
-        measured.push((metric.label, value));
-    }
-
-    let baseline_path = workspace_root().join(BENCH_BASELINE);
-    if record {
-        let mut json = String::from("{\n");
-        json.push_str(&format!("  \"recorded\": \"{}\",\n", today_iso8601()));
-        if let Some(version) = read_version() {
-            json.push_str(&format!("  \"version\": \"{version}\",\n"));
-        }
-        if let Some(commit) = git_commit() {
-            json.push_str(&format!("  \"git_commit\": \"{commit}\",\n"));
-        }
-        for (index, (label, value)) in measured.iter().enumerate() {
-            json.push_str(&format!(
-                "  \"{label}\": {value}{}\n",
-                if index + 1 == measured.len() { "" } else { "," }
-            ));
-        }
-        json.push_str("}\n");
-        if let Some(parent) = baseline_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("建目录失败：{error}"))?;
-        }
-        fs::write(&baseline_path, json).map_err(|error| format!("写基线失败：{error}"))?;
-        println!("[xtask] bench：基线已写入 {}", baseline_path.display());
-        return Ok(());
-    }
-
-    let baseline = fs::read_to_string(&baseline_path).map_err(|error| {
-        format!(
-            "读不到基线 {}（{error}）。先跑 `cargo xtask bench --record` 采集一次。",
-            baseline_path.display()
-        )
-    })?;
-    // 基线必须能回答"它是哪个版本测的"；跨版本比较只在"趋势"意义上有效。
-    if let (Some(baseline_version), Some(current_version)) =
-        (parse_baseline_string(&baseline, "version"), read_version())
-    {
-        if baseline_version != current_version {
-            println!(
-                "[xtask] bench：⚠ 基线版本 {baseline_version} ≠ 当前 {current_version}\
-                 （跨版本比较仅供趋势参考；要作为发布判据请先 `--record`）"
-            );
-        }
-    }
-    let mut regressions = Vec::new();
-    for (label, value) in &measured {
-        let Some(metric) = METRICS.iter().find(|metric| metric.label == *label) else {
-            return Err("指标表与实现不一致".to_string());
-        };
-        // 物理上限优先：超过它说明**测量方法**有问题，不是性能变好。
-        if let Some(maximum) = metric.maximum {
-            if *value > maximum {
-                regressions.push(format!(
-                    "{label}：实测 {value}，超过物理上限 {maximum} —— 测量方法可疑\
-                     （很可能是缓存/预取命中，不是器件带宽）"
-                ));
-                continue;
-            }
-        }
-        // 硬下限判定（与基线无关）。
-        if let Some(minimum) = metric.minimum {
-            if *value < minimum {
-                regressions.push(format!(
-                    "{label}：实测 {value}，低于硬下限 {minimum}（真机不达标，不是抖动问题）"
-                ));
-                continue;
-            }
-            println!("  {label}: 实测 {value}（硬下限 {minimum}）ok");
-            continue;
-        }
-        let Some(previous) = parse_baseline_value(&baseline, label) else {
-            continue;
-        };
-        if previous == 0 {
-            continue;
-        }
-        let worse = if metric.higher_is_better {
-            *value < previous
-        } else {
-            *value > previous
-        };
-        let delta_percent = (value.abs_diff(previous) * 100) / previous;
-        let absolute_delta = value.abs_diff(previous);
-        // 百分比与绝对量**同时**超限才算回归（见 `Metric::min_absolute_delta` 的说明）。
-        let status = if worse
-            && delta_percent > u64::from(BENCH_TOLERANCE_PERCENT)
-            && absolute_delta > metric.min_absolute_delta
-        {
-            regressions.push(format!(
-                "{label}：{previous} → {value}（退化 {delta_percent}%，绝对量 {absolute_delta}，\
-                 容差 {BENCH_TOLERANCE_PERCENT}% 且绝对量须超 {}）",
-                metric.min_absolute_delta
-            ));
-            "回归"
-        } else {
-            "ok"
-        };
-        println!(
-            "  {label}: 基线 {previous} / 实测 {value}（差 {delta_percent}%，绝对量 {absolute_delta}）{status}"
-        );
-    }
-    if regressions.is_empty() {
-        println!("[xtask] bench 通过：所有指标在 {BENCH_TOLERANCE_PERCENT}% 容差内");
-        return Ok(());
-    }
-    Err(format!(
-        "基准回归：\n  {}\n若这是有意为之（例如换了算法），用 `cargo xtask bench --record` 更新基线并在提交信息里说明原因。",
-        regressions.join("\n  ")
-    ))
 }
 
 /// JSON **结构冒烟检查**：括号/引号配平、无 `,,`、无 `{,`/`,}`。
@@ -1644,47 +1340,9 @@ fn read_json_or_null(path: &Path) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
-/// 从基线 JSON 里取某个标签的值（极简解析：不引入 JSON 依赖）。
-fn parse_baseline_value(baseline: &str, label: &str) -> Option<u64> {
-    let needle = format!("\"{label}\":");
-    let rest = baseline.split(&needle).nth(1)?;
-    let value = rest
-        .trim_start()
-        .split(|ch: char| !ch.is_ascii_digit())
-        .next()?;
-    value.parse().ok()
-}
 
-/// 从基线 JSON 里取一个字符串字段（同样不引入 JSON 依赖）。
-fn parse_baseline_string(baseline: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":");
-    let rest = baseline.split(&needle).nth(1)?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    Some(rest.split('"').next()?.to_string())
-}
 
-/// 读 `VERSION`（版本号唯一真源）。
-fn read_version() -> Option<String> {
-    fs::read_to_string(workspace_root().join("VERSION"))
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-/// 当前 `git` 提交短哈希（只用于基准留档；不是工作区时返回 `None`）。
-fn git_commit() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(workspace_root())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// 日期（ISO-8601 的日期部分）。只用于基准留档，不参与判定。
+/// 日期（ISO-8601 的日期部分）。用于 `context` 的生成时间戳。
 fn today_iso8601() -> String {
     std::process::Command::new("date")
         .arg("+%Y-%m-%d")
@@ -1694,6 +1352,9 @@ fn today_iso8601() -> String {
         .map(|text| text.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
+
+
+
 
 /// 找出**带 pyserial 的 python**。
 ///
@@ -1738,45 +1399,6 @@ fn resolve_pyocd() -> Option<String> {
     None
 }
 
-/// 复位板子并抓一段启动输出（**在复位之前**就开始读，否则会漏掉最早的行）。
-fn capture_boot_output(serial_path: &str, seconds: u64) -> Result<String, String> {
-    // 依赖 python3 + pyserial（`make setup` 已装）。用脚本而不是内嵌 Rust 串口库：
-    // 主机构建不该为一个基准门禁引入新的 crate 依赖。
-    // pyocd 与解释器都在 Rust 侧解析好再传进去：脚本里写死 `python3`/`pyocd`
-    // 会在"系统 python 没有 pyserial"或"pyocd 不在 PATH"时失败。
-    let pyocd = resolve_pyocd().unwrap_or_else(|| "pyocd".to_string());
-    let script = format!(
-        "import serial,time,subprocess,threading\n\
-         p=serial.Serial('{serial_path}',115200,timeout=0.2)\n\
-         p.reset_input_buffer()\n\
-         threading.Thread(target=lambda: subprocess.run(['{pyocd}','reset','--target','mimxrt1020'],capture_output=True),daemon=True).start()\n\
-         raw=b''\n\
-         start=time.time(); end=start+{seconds}; sent=False\n\
-         try:\n\
-         \x20   while time.time()<end:\n\
-         \x20       if not sent and time.time()-start>6:\n\
-         \x20           p.write(b'beat on\\n'); sent=True\n\
-         \x20       raw+=p.read(65536)\n\
-         finally:\n\
-         \x20   # 抓包结束必须关掉心跳：否则板子会一直每秒打印，\n\
-         \x20   # 用户看到的就是“默认关闭却一直在打”。\n\
-         \x20   if sent:\n\
-         \x20       p.write(b'beat off\\n')\n\
-         \x20       time.sleep(0.2)\n\
-         print(raw.decode('utf-8','replace'))\n"
-    );
-    let output = std::process::Command::new(resolve_python())
-        .args(["-c", &script])
-        .output()
-        .map_err(|error| format!("执行 python3 失败：{error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "抓包失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
 
 /// 统计 `crates/` 里的 unsafe 形态总数（与 `check-unsafe` **同口径**，供 `context` 输出）。
 ///
@@ -2101,7 +1723,6 @@ fn main() {
         "check-code-placement" => check_code_placement(),
         "gates" => gates(),
         "context" => context(),
-        "bench" => bench(),
         "tock-build" => tock_build(),
         "tock-flash" => tock_flash(),
         "tock-verify" => tock_verify(),
@@ -2276,11 +1897,6 @@ const COMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "coverage",
         what: "主机侧行覆盖率（阈值 90%）",
-        check: None,
-    },
-    Subcommand {
-        name: "bench",
-        what: "真机基准与基线回归（--record 采集，--from-file 离线取数）",
         check: None,
     },
     Subcommand {
@@ -2599,7 +2215,7 @@ fn check_capsules() -> Result<(), String> {
 /// `console_rx`（`LPUART1`）与 `deadline_tick`（`PIT`）**同为 1** 是刻意的：
 /// 两者互不抢占，相对字节间隔/时基周期分别有 4×/50× 余量。
 /// `budget::prio::SERIAL_RX=2` 属于**尚未落地**的串行总线任务，不是 `console_rx`
-/// （见 `docs/02-架构/中断与idle轮询分析.md` §3）。
+/// （见 `docs/架构与实现.md` §3）。
 const EXPECTED_TASK_PRIORITIES: &[(&str, u8)] = &[("LPUART1", 1), ("PIT", 1)];
 
 /// 中断任务优先级门禁。
@@ -2661,7 +2277,7 @@ fn check_interrupt_priorities() -> Result<(), String> {
             .any(|(expected, _)| expected == name)
         {
             return Err(format!(
-                "发现未登记的中断任务 {name}：新增任务必须同时登记本门禁与 docs/02-架构/中断与idle轮询分析.md"
+                "发现未登记的中断任务 {name}：新增任务必须同时登记本门禁与 docs/架构与实现.md"
             ));
         }
     }
@@ -3832,7 +3448,7 @@ fn tock_flash() -> Result<(), String> {
     let root = workspace_root();
     let elf = root.join(TOCK_ELF);
     let pyocd = resolve_pyocd().ok_or(
-        "找不到 pyocd：先跑一次台架准备（见 docs/04-开发/台架准备与排障.md），或设置 PYOCD",
+        "找不到 pyocd：先跑一次台架准备（见 docs/构建与验证.md），或设置 PYOCD",
     )?;
     let status = std::process::Command::new(&pyocd)
         .args([

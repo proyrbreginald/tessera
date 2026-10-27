@@ -63,7 +63,7 @@ const CHUNK: usize = 32;
 
 /// 双份存储。
 ///
-/// `SLOT` 是单份副本的槽位大小，由布局决定（见 `docs/02-架构/内存与Flash布局.md`）。
+/// `SLOT` 是单份副本的槽位大小，由布局决定（见 `docs/硬件与板级事实.md`）。
 #[derive(Debug)]
 pub struct DoubleBankStore<M, const SLOT: usize> {
     medium: M,

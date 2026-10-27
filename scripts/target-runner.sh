@@ -2,7 +2,7 @@
 # Cargo `runner`：目标端产物无法在主机上执行。
 #
 # 存在这个脚本的意义是把内核那句含糊的 "exec format error" 换成一条能读懂的信息。
-# 目标端（HIL）测试需要真实硬件，见 docs/04-开发/测试策略.md 的 L6 层。
+# 目标端（HIL）测试需要真实硬件，见 docs/构建与验证.md 的 L6 层。
 set -euo pipefail
 cat >&2 <<'MSG'
 [runner] 这是目标端（thumbv7em-none-eabihf）产物，不能在主机上运行。
