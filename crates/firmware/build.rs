@@ -25,7 +25,7 @@ const FLASH_SIZE: usize = 32 * 1024 * 1024;
 /// 构建脚本**先于**所有 crate 编译，拿不到 `memory-layout::STACK_SIZE`
 /// （那会造成循环依赖）。所以"值"在这里，"含义"在
 /// [`memory_layout`](../memory-layout/src/lib.rs) 里。两者由**两道**检查绑死：
-/// 本文件生成的编译期断言（不一致就编译失败）+ `cargo xtask check-memory`
+/// 本文件生成的编译期断言（不一致就编译失败）+ `cargo xtask gate memory`
 /// （再从链接产物的 `.stack` 段核实一次大小）。
 const STACK_BYTES: usize = 48 * 1024;
 

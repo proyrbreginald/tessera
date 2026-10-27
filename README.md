@@ -20,7 +20,7 @@ cargo xtask context         # 机器可读项目上下文（crate/门禁/缺口/
 真机（需要台架 pyocd/pyserial；详见 [构建与验证](docs/构建与验证.md)）：
 
 ```bash
-bash scripts/flash.sh -e chip   # 全片擦除 + 烧录（改分区/FS 格式后必须）
+cargo xtask flash --erase   # 全片擦除 + 烧录（改分区/FS 格式后必须）
 bash scripts/read_console.py --seconds 5   # 看串口
 cargo xtask bytecheck                  # 控制台逐字节校验（改时钟/中断后必跑）
 cargo xtask test-target                # 目标端自检 5 项
@@ -66,7 +66,7 @@ tests/        主机集成测试与编译失败负例
 | [业务接入](docs/业务接入.md) | capsule SDK/端口契约、仓库外业务 crate |
 | [Tock 运行时](docs/Tock运行时.md) | 固定运行时（迁移中）：构建/烧录/限制 |
 | [Flash 布局](docs/02-架构/Flash布局与用途划分.md) · [分层规则](docs/02-架构/分层与依赖规则.md) | 分区表与依赖边界（门禁核对） |
-| [需求规格](docs/01-需求/需求规格.md) | 30 条平台需求（`cargo xtask trace` 生成追溯矩阵） |
+| [需求规格](docs/01-需求/需求规格.md) | 30 条平台需求（`cargo xtask gate trace` 生成追溯矩阵） |
 
 ## 硬约束（详见文档）
 

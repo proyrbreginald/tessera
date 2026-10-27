@@ -317,7 +317,7 @@ pub trait ShellContext {
     /// # 为什么直接用 `realtime::RtMetrics`，而不是像 `FsSnapshot` 那样再造一个本地镜像结构
     ///
     /// 判据只有一条：**这个类型所在的 crate 是不是纯逻辑层**。`realtime` 是纯逻辑
-    /// crate（零寄存器访问、零 `unsafe`、可主机测试；`cargo xtask check-layering`
+    /// crate（零寄存器访问、零 `unsafe`、可主机测试；`cargo xtask gate layering`
     /// 验证它的依赖闭包里没有 `imxrt-*` / `cortex-m` / `rtic`），因此终端可以直接依赖它、
     /// 直接在 trait 上用它的类型 —— 与 `shell` 早就依赖 `primitives` 同理。
     /// [`FsSnapshot`] 走的是另一条路（在本 crate 里重新声明一遍字段），理由见它自己的文档。

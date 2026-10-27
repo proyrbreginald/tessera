@@ -315,7 +315,7 @@ pub mod lut_words {
 /// LUT 序列号（与官方 `fsl_romapi.h` 的 `NOR_CMD_LUT_SEQ_IDX_*` 完全一致）。
 ///
 /// ⚠️ 这几个数字**必须**与 Boot ROM 的约定一致：ROM 按自己的索引去取 LUT 表项。
-/// 我们 FCB 里的 LUT 也是按这套索引排的（`cargo xtask check-image` 从链接产物断言其内容）。
+/// 我们 FCB 里的 LUT 也是按这套索引排的（`cargo xtask gate image` 从链接产物断言其内容）。
 pub mod seq {
     /// 读（`0xEC` + 4 字节地址相位）。
     pub const READ: u8 = 0;

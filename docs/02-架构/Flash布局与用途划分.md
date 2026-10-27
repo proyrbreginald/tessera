@@ -1,7 +1,7 @@
 # Flash 布局与用途划分
 
 > 分区表**唯一事实来源**是 [`crates/flash-layout`](../../crates/flash-layout/src/lib.rs)：
-> BSP 引用它、`cargo xtask check-flash-map` 遍历它、下表的偏移由该门禁逐行核对。
+> BSP 引用它、`cargo xtask gate flash-map` 遍历它、下表的偏移由该门禁逐行核对。
 > 本节只解释"为什么这样分"。
 
 ## 1. 寻址：整片 32 MiB 可用（不靠模式切换）
@@ -13,7 +13,7 @@ W25Q256 上电是 3 字节地址模式（上限 16 MiB）。项目采用**专用
 
 两道锁：
 
-1. 构建期：`cargo xtask check-image` 从 ELF 的 FCB LUT 断言三个序列的命令字节与地址相位；
+1. 构建期：`cargo xtask gate image` 从 ELF 的 FCB LUT 断言三个序列的命令字节与地址相位；
 2. 运行期：每次启动跑别名自检（读 `16 MiB + 0x1000`，不应再出现 IVT 魔数），
    启动横幅打印 `flash 4B : ... PASS`。
 

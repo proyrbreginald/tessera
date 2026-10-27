@@ -2210,7 +2210,7 @@ fn cmd_clear(env: &mut CommandEnv<'_>) -> CommandStatus {
 /// # 为什么数组里存 `"P2"` 而不是 `"GAP(P2)"`
 ///
 /// 打印出来仍然是 `GAP(P2)`（与源码标记同形，现场可 grep）。但**字面量**刻意
-/// 拆成"里程碑 + 文本"：`cargo xtask check-gaps` 是按行搜索 `GAP(` 清点的，
+/// 拆成"里程碑 + 文本"：`cargo xtask gate gaps` 是按行搜索 `GAP(` 清点的，
 /// 如果这里也写出完整标记，同一条缺口会被数两遍（实现点一次、复述一次），
 /// 于是门禁报出的"未实现项总数"就不再是"缺口个数"——而那个数字正是它存在的
 /// 意义。终端要展示的是**结论**，不该污染清点口径。
@@ -2251,7 +2251,7 @@ fn cmd_gaps(env: &mut CommandEnv<'_>) -> CommandStatus {
     }
     write_ignore!(
         env.out,
-        "这些项在各自的实现点都带缺口标记，`cargo xtask check-gaps` 会清点。\r\n"
+        "这些项在各自的实现点都带缺口标记，`cargo xtask gate gaps` 会清点。\r\n"
     );
     CommandStatus::Ok
 }

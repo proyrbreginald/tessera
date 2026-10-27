@@ -37,7 +37,7 @@ pub enum BusError {
     /// 该功能尚未实现（里程碑未到）。
     ///
     /// 刻意保留这个变体而不是 `todo!()`：未实现必须是**可观测的运行时事实**，
-    /// 而不是一次 panic（**平台需求 MT-3**）。`cargo xtask check-gaps` 会清点
+    /// 而不是一次 panic（**平台需求 MT-3**）。`cargo xtask gate gaps` 会清点
     /// 所有未实现点。
     NotImplemented,
 }

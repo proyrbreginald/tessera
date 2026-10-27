@@ -1,7 +1,7 @@
 # 文档索引
 
 > 重构后只保留最核心的几篇；旧文档（ADR、需求评审、安全计划等）已合并/精简。
-> 文档中的数字由 `cargo xtask check-docs` 与代码对齐；会漂移的测量值请用
+> 文档中的数字由 `cargo xtask gate docs` 与代码对齐；会漂移的测量值请用
 > `cargo xtask context` 取，不要写死在文档里。
 
 | 文档 | 内容 |

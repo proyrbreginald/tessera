@@ -127,12 +127,6 @@ fn lint_target() -> Result<(), String> {
 }
 
 /// 打印纯逻辑 crate 列表（一行一个，供脚本/Agent 取用）。
-fn pure_crates() -> Result<(), String> {
-    for name in PURE_CRATES {
-        println!("{name}");
-    }
-    Ok(())
-}
 
 /// 从链接产物里读出一个段的（VMA, 大小）。
 struct SectionInfo {
@@ -363,10 +357,7 @@ fn check_docs() -> Result<(), String> {
     let mut gaps = Vec::new();
     collect_gaps(&root.join("crates"), &mut gaps)?;
     // 静态门禁的条数：**从命令表现算**（`COMMANDS` 里带 `check` 的那些）。
-    let static_gates = COMMANDS
-        .iter()
-        .filter(|command| command.check.is_some())
-        .count();
+    let static_gates = GATES.len();
 
     // ---- 断言：文档里的**那一句话**必须与事实一致 ----
     // (文件, 必须出现的字符串, 这句话的含义)
@@ -380,11 +371,6 @@ fn check_docs() -> Result<(), String> {
             "AGENTS.md",
             format!("**{pure} 个纯逻辑**"),
             "规模行：可主机测试的纯逻辑 crate 数",
-        ),
-        (
-            "AGENTS.md",
-            format!("check-layering` | {pure} 个纯逻辑 crate"),
-            "命令表：check-layering 覆盖的纯逻辑 crate 数",
         ),
         (
             "AGENTS.md",
@@ -957,28 +943,21 @@ fn check_fault_handlers() -> Result<(), String> {
 /// `gates` 相反：全部跑完，逐项给出 PASS/FAIL，**退出码仍然反映是否全过**，
 /// 因此它同时适合人看与脚本/Agent 消费（每行一个 `名称 PASS/FAIL`）。
 fn gates() -> Result<(), String> {
-    // 门禁清单来自 `COMMANDS`（唯一来源），这里不再另写一份。
-    let checks: Vec<(&str, fn() -> Result<(), String>)> = COMMANDS
-        .iter()
-        .filter_map(|command| command.check.map(|check| (command.name, check)))
-        .collect();
-
+    // 门禁清单来自 `GATES`（唯一来源）。
     let mut failures: Vec<(&str, String)> = Vec::new();
     println!("门禁汇总（每行：名称 结果）");
-    for (name, check) in &checks {
-        // 门禁自己的输出照常打到 stdout（人看）；这里只记结果。
-        match check() {
-            Ok(()) => println!("  {name:<20} PASS"),
+    for gate in GATES {
+        match (gate.run)() {
+            Ok(()) => println!("  {:<20} PASS", gate.name),
             Err(reason) => {
-                // 原因可能多行：只取首行做汇总，完整原因在下面的详情里给出。
                 let first_line = reason.lines().next().unwrap_or("失败").to_string();
-                println!("  {name:<20} FAIL  {first_line}");
-                failures.push((name, reason));
+                println!("  {:<20} FAIL  {first_line}", gate.name);
+                failures.push((gate.name, reason));
             }
         }
     }
     if failures.is_empty() {
-        println!("\n[xtask] gates：全部 {} 项通过", checks.len());
+        println!("\n[xtask] gates：全部 {} 项通过", GATES.len());
         return Ok(());
     }
     let mut detail = String::new();
@@ -988,9 +967,26 @@ fn gates() -> Result<(), String> {
     Err(format!(
         "{} / {} 项门禁失败：{}",
         failures.len(),
-        checks.len(),
+        GATES.len(),
         detail
     ))
+}
+
+/// 单跑一项静态门禁：`cargo xtask gate <name>`。
+fn run_gate() -> Result<(), String> {
+    let name = std::env::args().nth(2).ok_or_else(|| {
+        format!(
+            "用法：cargo xtask gate <name>\n可选：{}",
+            GATES.iter().map(|gate| gate.name).collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    let gate = GATES.iter().find(|gate| gate.name == name).ok_or_else(|| {
+        format!(
+            "未知门禁：{name}\n可选：{}",
+            GATES.iter().map(|gate| gate.name).collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    (gate.run)()
 }
 
 /// 风格门禁：把"写在文档里的规矩"变成**可执行的检查**。
@@ -1154,18 +1150,23 @@ fn context() -> Result<(), String> {
 
     // 门禁清单（人读描述；agent 可直接照抄命令）。
     out.push_str("  \"gates\": [\n");
-    for (index, command) in COMMANDS.iter().enumerate() {
+    for (index, gate) in GATES.iter().enumerate() {
         if index > 0 {
             out.push_str(",\n");
         }
         out.push_str(&format!(
-            "    {{\"command\": \"cargo xtask {}\", \"what\": \"{}\", \"is_static_gate\": {}}}",
-            command.name,
-            command.what,
-            command.check.is_some()
+            "    {{\"command\": \"cargo xtask gate {}\", \"what\": \"{}\", \"is_static_gate\": true}}",
+            gate.name, gate.what
         ));
     }
-    out.push_str("\n  ],\n");
+    out.push_str("\n  ],\n    \"commands\": [");
+    for (index, command) in COMMANDS.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("\"cargo xtask {}\"", command.name));
+    }
+    out.push_str("],\n");
 
     // 未实现项：现算。
     let mut gaps: Vec<(String, String, String)> = Vec::new();
@@ -1605,7 +1606,7 @@ fn coverage() -> Result<(), String> {
         format!("{{\"line_percent\": {percent:.2}, \"threshold_percent\": {MIN_LINE_COVERAGE_PERCENT:.0}}}\n"),
     );
     println!(
-        "注：覆盖率只统计**主机可测**的纯逻辑 crate（名单见 `cargo xtask pure-crates`）；BSP/固件的正确性由产物级断言 \
+        "注：覆盖率只统计**主机可测**的纯逻辑 crate（名单由 xtask 内 `PURE_CRATES` 唯一维护）；BSP/固件的正确性由产物级断言 \
          （check-image / check-flash-map）与真机自报事实承担。"
     );
     Ok(())
@@ -1681,52 +1682,22 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
     let result = match command {
-        "check-layering" => check_layering(),
-        "check-capsules" => check_capsules(),
-        "check-interrupt-priorities" => check_interrupt_priorities(),
-        "check-lint-headers" => check_lint_headers(),
-        "check-unsafe" => check_unsafe(),
-        "check-gaps" => check_gaps(),
-        "check-image" => check_image(),
-        "check-size" => check_size(),
-        "check-flash-map" => check_flash_map(),
-        "test-host" => test_host(),
-        "lint-host" => lint_host(),
-        "lint-target" => lint_target(),
-        "pure-crates" => pure_crates(),
-        "coverage" => coverage(),
-        "check-fault-handlers" => check_fault_handlers(),
-        "check-critical" => check_critical(),
-        "check-api-usage" => check_api_usage(),
-        "check-style" => check_style(),
-        "check-docs" => check_docs(),
-        "check-memory" => check_memory(),
-        "check-code-placement" => check_code_placement(),
+        "verify" => verify(),
         "gates" => gates(),
+        "gate" => run_gate(),
+        "test-host" => test_host(),
+        "coverage" => coverage(),
         "context" => context(),
+        "setup" => run_script("scripts/setup-bench.sh", &[], "建 Python 虚拟环境"),
+        "flash" => xtask_flash(),
+        "reset" => xtask_reset(),
+        "monitor" => run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移"),
+        "bytecheck" => run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验"),
+        "test-target" => xtask_test_target(),
+        "soak" => xtask_soak(),
         "tock-build" => tock_build(),
-        "tock-flash" => tock_flash(),
         "tock-verify" => tock_verify(),
         "tock-sync-boot-header" => tock_sync_boot_header(),
-        "setup" => run_script("scripts/setup-bench.sh", &[], "建 Python 虚拟环境"),
-        "check-bench" => run_script("scripts/check-bench.sh", &[], "台架就绪检查"),
-        "check" => xtask_check(),
-        "evidence" => run_script("scripts/record-evidence.sh", &[], "登记真机证据"),
-        "image" => xtask_image(),
-        "size" => xtask_size(),
-        "objcopy" => xtask_objcopy(),
-        "flash" => run_script("scripts/flash.sh", &[], "烧录固件"),
-        "flash-erase" => run_script("scripts/flash.sh", &["-e", "chip"], "全片擦除并烧录"),
-        "run" => xtask_run(),
-        "bytecheck" => run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验"),
-        "monitor" => run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移"),
-        "soak" => xtask_soak(),
-        "test-target" => xtask_test_target(),
-        "reset" => xtask_reset(),
-        "release-check" => xtask_release_check(),
-        "check-compile-fail" => check_compile_fail(),
-        "trace" => trace(),
-        "verify" => verify(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -1750,188 +1721,64 @@ fn main() {
 /// 2026-10-10 的教训：此前 `help` 手写一份、`gates` 手写一份、`context` 又手写一份，
 /// 于是新增的 8 个子命令（含 `check-flash-map`）**只在源码里存在、在 `help` 里查不到**。
 /// 接手者（尤其是 Agent）判断"有什么可用"的第一入口就是 `cargo xtask`，它不能漏。
+/// 一个静态门禁：`gates` 汇总、`gate <name>` 单跑、`verify` 内部也会调用。
+struct Gate {
+    /// 门禁名（`cargo xtask gate <name>` 的参数）。
+    name: &'static str,
+    /// 一句话说明。
+    what: &'static str,
+    /// 检查函数。
+    run: fn() -> Result<(), String>,
+}
+
+/// 18 项静态门禁（顺序即 `gates` 输出顺序）。
+const GATES: &[Gate] = &[
+    Gate { name: "layering", what: "纯逻辑 crate 的依赖闭包里不含硬件 crate", run: check_layering },
+    Gate { name: "capsules", what: "插件只依赖 sdk/端口层，不碰硬件/组合根", run: check_capsules },
+    Gate { name: "interrupt-priorities", what: "中断任务优先级与预算表一致", run: check_interrupt_priorities },
+    Gate { name: "lint-headers", what: "每个 crate 带标准 lint 头（含 forbid(unsafe_code)）", run: check_lint_headers },
+    Gate { name: "unsafe", what: "unsafe 块与 SAFETY 配平，且不超预算", run: check_unsafe },
+    Gate { name: "gaps", what: "清点 GAP(Px) 未实现项（刻意不失败）", run: check_gaps },
+    Gate { name: "fault-handlers", what: "故障向量各有真实实现（空桩会被抓）", run: check_fault_handlers },
+    Gate { name: "critical", what: "关中断只能走测量入口", run: check_critical },
+    Gate { name: "api-usage", what: "列出没有调用者的公开项（刻意不失败）", run: check_api_usage },
+    Gate { name: "style", what: "无 todo!/unimplemented!、每 crate 有模块文档", run: check_style },
+    Gate { name: "docs", what: "文档数字/可达性/命令存在性", run: check_docs },
+    Gate { name: "memory", what: "内存放置：.text/.stack/.vector_table", run: check_memory },
+    Gate { name: "code-placement", what: "代码放置：.xip 白名单", run: check_code_placement },
+    Gate { name: "image", what: "FCB/IVT/LUT 4 字节相位/初始 SP", run: check_image },
+    Gate { name: "size", what: "映像 < 1 MiB", run: check_size },
+    Gate { name: "flash-map", what: "分区表自洽 + 文档表格一致", run: check_flash_map },
+    Gate { name: "compile-fail", what: "编译失败负例确实失败", run: check_compile_fail },
+    Gate { name: "trace", what: "需求追溯矩阵与覆盖率", run: trace },
+];
+
+/// 一个公开子命令。
 struct Subcommand {
     /// 子命令名。
     name: &'static str,
     /// 一句话说明。
     what: &'static str,
-    /// 是否属于 `gates` 汇总的静态门禁，以及对应哪个检查函数。
-    check: Option<fn() -> Result<(), String>>,
 }
 
-/// 全部子命令。
+/// 公开子命令（`help` 的唯一来源；诊断类静态门禁统一走 `gate <name>`）。
 const COMMANDS: &[Subcommand] = &[
-    Subcommand {
-        name: "check-layering",
-        what: "纯逻辑 crate 的依赖闭包里不含硬件 crate",
-        check: Some(check_layering),
-    },
-    Subcommand {
-        name: "check-capsules",
-        what: "capsule 插件只依赖 sdk/端口层，不碰硬件/组合根",
-        check: Some(check_capsules),
-    },
-    Subcommand {
-        name: "check-interrupt-priorities",
-        what: "中断任务优先级与预算表一致（RTIC 字面量无法被编译器绑定）",
-        check: Some(check_interrupt_priorities),
-    },
-    Subcommand {
-        name: "check-lint-headers",
-        what: "每个 crate 带标准 lint 头（含 forbid(unsafe_code)）",
-        check: Some(check_lint_headers),
-    },
-    Subcommand {
-        name: "check-unsafe",
-        what: "unsafe 块与 // SAFETY: 配平，且不超预算",
-        check: Some(check_unsafe),
-    },
-    Subcommand {
-        name: "check-gaps",
-        what: "清点 GAP(Px) 未实现项（刻意不失败）",
-        check: Some(check_gaps),
-    },
-    Subcommand {
-        name: "check-fault-handlers",
-        what: "故障处理器：四个故障向量必须各有真实实现（空桩会被抓）",
-        check: Some(check_fault_handlers),
-    },
-    Subcommand {
-        name: "check-critical",
-        what: "关中断只能走测量入口（否则没人知道这个窗口有多长）",
-        check: Some(check_critical),
-    },
-    Subcommand {
-        name: "check-api-usage",
-        what: "列出没有任何调用者的公开项（刻意不失败，但必须可见）",
-        check: Some(check_api_usage),
-    },
-    Subcommand {
-        name: "check-style",
-        what: "风格门禁：无 todo!/unimplemented!、每 crate 有模块文档、lint 未放宽",
-        check: Some(check_style),
-    },
-    Subcommand {
-        name: "check-docs",
-        what: "文档里的关键数字与代码/产物一致（防止文档漂移）",
-        check: Some(check_docs),
-    },
-    Subcommand {
-        name: "check-memory",
-        what: "内存放置：.text 在 ITCM 且不超预算、.stack/.vector_table 在 DTCM",
-        check: Some(check_memory),
-    },
-    Subcommand {
-        name: "check-code-placement",
-        what: "代码放置：.xip 在 Flash 内，且擦写期间必须能跑的模块不在 .xip",
-        check: Some(check_code_placement),
-    },
-    Subcommand {
-        name: "check-image",
-        what: "对链接后的 ELF 断言 FCB/IVT/向量表布局",
-        check: Some(check_image),
-    },
-    Subcommand {
-        name: "check-size",
-        what: "固件体积 < 1 MiB",
-        check: Some(check_size),
-    },
-    Subcommand {
-        name: "check-flash-map",
-        what: "分区表自洽 + 文档表格与代码一致",
-        check: Some(check_flash_map),
-    },
-    Subcommand {
-        name: "check-compile-fail",
-        what: "编译失败用例确实编译失败（类型约束是硬的）",
-        check: Some(check_compile_fail),
-    },
-    Subcommand {
-        name: "trace",
-        what: "生成需求追溯矩阵并检查覆盖",
-        check: Some(trace),
-    },
-    Subcommand {
-        name: "verify",
-        what: "以上全部 + fmt + clippy + 主机测试 + 目标构建",
-        check: None,
-    },
-    Subcommand {
-        name: "help",
-        what: "列出全部子命令（与不带参数相同）",
-        check: None,
-    },
-    Subcommand {
-        name: "gates",
-        what: "跑完全部静态门禁并给出汇总表（不因第一个失败而中断）",
-        check: None,
-    },
-    Subcommand {
-        name: "test-host",
-        what: "主机测试（纯逻辑层全部 crate）",
-        check: None,
-    },
-    Subcommand {
-        name: "lint-host",
-        what: "主机 lint",
-        check: None,
-    },
-    Subcommand {
-        name: "lint-target",
-        what: "固件目标 lint",
-        check: None,
-    },
-    Subcommand {
-        name: "pure-crates",
-        what: "打印纯逻辑 crate 列表（一行一个）",
-        check: None,
-    },
-    Subcommand {
-        name: "context",
-        what: "机器可读的项目上下文（JSON）",
-        check: None,
-    },
-    Subcommand {
-        name: "coverage",
-        what: "主机侧行覆盖率（阈值 90%）",
-        check: None,
-    },
-    Subcommand {
-        name: "tock-build",
-        what: "构建 tock/ 下的 Tock 镜像（后续固定运行时；不参与当前生产固件）",
-        check: None,
-    },
-    Subcommand {
-        name: "tock-flash",
-        what: "构建并全片擦除烧录 Tock 镜像（需要台架）",
-        check: None,
-    },
-    Subcommand {
-        name: "tock-verify",
-        what: "构建→烧录→串口验证 Tock 镜像（启动横幅 + 行回显）",
-        check: None,
-    },
-    Subcommand {
-        name: "tock-sync-boot-header",
-        what: "从生产固件 ELF 重新生成 Tock 板级 crate 的 8 KiB 启动头（FCB+IVT）",
-        check: None,
-    },
-    Subcommand { name: "setup", what: "建 Python 虚拟环境（pyocd/pyserial，无需 root）", check: None },
-    Subcommand { name: "check-bench", what: "台架就绪门禁（探针/SWD/pyocd；烧录前必须通过）", check: None },
-    Subcommand { name: "check", what: "静态检查：fmt + 目标/主机 clippy", check: None },
-    Subcommand { name: "evidence", what: "登记一次真机证据到 tmp/evidence/", check: None },
-    Subcommand { name: "image", what: "构建并对 ELF 断言 FCB/IVT/向量表布局", check: None },
-    Subcommand { name: "size", what: "构建并检查固件体积与上限", check: None },
-    Subcommand { name: "objcopy", what: "构建并生成 .bin / .hex 交付物", check: None },
-    Subcommand { name: "flash", what: "烧录（不带全片擦除）", check: None },
-    Subcommand { name: "flash-erase", what: "全片擦除后烧录（改分区/FS 格式后必须）", check: None },
-    Subcommand { name: "run", what: "烧录并抓串口（monitor）", check: None },
-    Subcommand { name: "bytecheck", what: "控制台逐字节校验（改动控制台/时钟后必跑）", check: None },
-    Subcommand { name: "monitor", what: "抓串口并检验时基漂移（±2%）", check: None },
-    Subcommand { name: "soak", what: "长稳采集（--minutes N 可调，默认 30）", check: None },
-    Subcommand { name: "test-target", what: "目标端自检 5 项（需要板子）", check: None },
-    Subcommand { name: "reset", what: "复位目标板", check: None },
-    Subcommand { name: "release-check", what: "发布前检查：verify + coverage + 台架 + bytecheck + monitor", check: None },
+    Subcommand { name: "verify", what: "唯一全量入口：门禁 + fmt/clippy + 主机测试 + 构建 + 产物断言" },
+    Subcommand { name: "gates", what: "18 项静态门禁汇总（不因第一个失败而中断）" },
+    Subcommand { name: "gate", what: "单跑一项静态门禁：cargo xtask gate <name>" },
+    Subcommand { name: "test-host", what: "主机测试（纯逻辑层）" },
+    Subcommand { name: "coverage", what: "主机侧行覆盖率（阈值 90%）" },
+    Subcommand { name: "context", what: "机器可读项目上下文（JSON）" },
+    Subcommand { name: "setup", what: "建 Python 虚拟环境（pyocd/pyserial）" },
+    Subcommand { name: "flash", what: "构建并烧录（加 --erase 全片擦除；改分区/FS 格式后必须）" },
+    Subcommand { name: "reset", what: "复位目标板" },
+    Subcommand { name: "monitor", what: "抓串口并检验时基漂移（±2%）" },
+    Subcommand { name: "bytecheck", what: "控制台逐字节校验（改控制台/时钟后必跑）" },
+    Subcommand { name: "test-target", what: "目标端自检 5 项（需要板子）" },
+    Subcommand { name: "soak", what: "长稳采集（--minutes N，默认 30）" },
+    Subcommand { name: "tock-build", what: "构建 tock/ 下的 Tock 镜像" },
+    Subcommand { name: "tock-verify", what: "构建 + 烧录 + 串口验证 Tock 镜像" },
+    Subcommand { name: "tock-sync-boot-header", what: "从生产固件同步 Tock 的 8 KiB 启动头" },
 ];
 
 fn print_help() {
@@ -3458,56 +3305,14 @@ fn build_firmware() -> Result<(), String> {
 }
 
 /// 静态检查：fmt + 目标/主机 clippy。
-fn xtask_check() -> Result<(), String> {
-    run("cargo", &["fmt", "--all", "--check"])?;
-    lint_target()?;
-    lint_host()
-}
 
 /// 构建 + 产物布局断言。
-fn xtask_image() -> Result<(), String> {
-    build_firmware()?;
-    check_image()
-}
 
 /// 构建 + 体积断言。
-fn xtask_size() -> Result<(), String> {
-    build_firmware()?;
-    check_size()
-}
 
 /// 构建 + 生成 `.bin`/`.hex` 交付物（工具链自带 llvm-objcopy）。
-fn xtask_objcopy() -> Result<(), String> {
-    build_firmware()?;
-    let root = workspace_root();
-    let elf = root.join("target/thumbv7em-none-eabihf/release/firmware");
-    let objcopy = llvm_objcopy_path()?;
-    let out_bin = root.join("target/thumbv7em-none-eabihf/release/firmware.bin");
-    let out_hex = root.join("target/thumbv7em-none-eabihf/release/firmware.hex");
-    for (format, out) in [("binary", &out_bin), ("ihex", &out_hex)] {
-        let status = std::process::Command::new(&objcopy)
-            .args(["-O", format])
-            .arg(&elf)
-            .arg(out)
-            .status()
-            .map_err(|error| format!("执行 llvm-objcopy 失败：{error}"))?;
-        if !status.success() {
-            return Err(format!("llvm-objcopy 生成 {format} 失败"));
-        }
-    }
-    println!(
-        "[xtask] objcopy 完成：{} / {}",
-        out_bin.display(),
-        out_hex.display()
-    );
-    Ok(())
-}
 
 /// 烧录 + 抓串口。
-fn xtask_run() -> Result<(), String> {
-    run_script("scripts/flash.sh", &[], "烧录固件")?;
-    run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移")
-}
 
 /// 长稳采集（`--minutes N`，默认 30）。
 fn xtask_soak() -> Result<(), String> {
@@ -3546,6 +3351,32 @@ fn xtask_test_target() -> Result<(), String> {
     Ok(())
 }
 
+/// 构建并烧录固件（Rust 直接调用 pyocd；`--erase` 全片擦除）。
+fn xtask_flash() -> Result<(), String> {
+    build_firmware()?;
+    let root = workspace_root();
+    let elf = root.join("target/thumbv7em-none-eabihf/release/firmware");
+    let pyocd = resolve_pyocd().ok_or("找不到 pyocd：先跑 `cargo xtask setup`，或设置 PYOCD")?;
+    let erase = std::env::args().any(|argument| argument == "--erase");
+    let mut command = std::process::Command::new(pyocd);
+    command.args(["load", "--target", "mimxrt1020", "--format", "elf"]);
+    if erase {
+        command.args(["-e", "chip"]);
+    }
+    command.arg(&elf).current_dir(&root);
+    let status = command
+        .status()
+        .map_err(|error| format!("执行 pyocd 失败：{error}"))?;
+    if !status.success() {
+        return Err("pyocd 烧录失败".to_string());
+    }
+    println!(
+        "[xtask] flash 完成：{}",
+        if erase { "全片擦除并烧录" } else { "烧录" }
+    );
+    Ok(())
+}
+
 /// 复位目标板。
 fn xtask_reset() -> Result<(), String> {
     let pyocd = resolve_pyocd().ok_or("找不到 pyocd：先跑 `cargo xtask setup`，或设置 PYOCD")?;
@@ -3561,14 +3392,6 @@ fn xtask_reset() -> Result<(), String> {
 }
 
 /// 发布前检查：verify + coverage + 台架 + bytecheck + monitor。
-fn xtask_release_check() -> Result<(), String> {
-    verify()?;
-    coverage()?;
-    run_script("scripts/check-bench.sh", &[], "台架就绪检查")?;
-    run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验")?;
-    xtask_reset()?;
-    run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移")
-}
 
 // ---------------------------------------------------------------- Tock（固定运行时；迁移中）
 

@@ -21,7 +21,6 @@ tock/
 
 ```bash
 cargo xtask tock-build            # 构建
-cargo xtask tock-flash            # 构建 + 全片擦除烧录
 cargo xtask tock-verify           # 构建 + 烧录 + 串口断言
 cargo xtask tock-sync-boot-header # 生产启动头变更后同步 boot_hdr.bin
 ```

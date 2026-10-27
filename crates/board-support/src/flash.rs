@@ -26,7 +26,7 @@
 //! 不重算 dummy，会读到垃圾数据、表现为**启动即崩溃**。
 //! **两者要么一起改，要么都别动。**
 //!
-//! 这条约束不是靠注释守住的：`cargo xtask check-image` 会从链接好的 ELF 里
+//! 这条约束不是靠注释守住的：`cargo xtask gate image` 会从链接好的 ELF 里
 //! 按数据手册偏移读出 FCB 的 tag/版本/容量/读序列并逐项断言，
 //! 因此任何回归都在**构建期**失败，而不是在板子上失败。
 
@@ -252,6 +252,6 @@ pub static FLEXSPI_CONFIGURATION_BLOCK: nor::ConfigurationBlock = SERIAL_NOR_PAR
 // 而裸机目标是 `no_std`、没有测试框架；主机目标又不编译本模块。
 // 写一组永不执行的测试只会给出假信心。
 //
-// 因此 FCB 的**字节级校验由 `cargo xtask check-image` 承担**：它直接从链接好的
+// 因此 FCB 的**字节级校验由 `cargo xtask gate image` 承担**：它直接从链接好的
 // ELF 里按数据手册偏移读出 tag、版本、容量与读序列并断言。那是**产物级**证据，
 // 比在源码里断言结构体更强 —— 它同时证明这些值真的落到了镜像里。

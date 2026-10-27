@@ -4,13 +4,13 @@
 //!
 //! 理由不是洁癖，而是可测试性：真实的寄存器写入、中断时序与电气连接无法在主机上
 //! 验证。既然无法消除这一层，就让它尽可能薄，并把它的边界做成编译期事实 ——
-//! 只有本 crate 的依赖闭包里会出现 `imxrt-*`，`cargo xtask check-layering` 强制这一点。
+//! 只有本 crate 的依赖闭包里会出现 `imxrt-*`，`cargo xtask gate layering` 强制这一点。
 //!
 //! # unsafe 预算
 //!
 //! 本 crate **允许** `unsafe`，但每一处都必须：
 //!
-//! 1. 紧邻一条 `// SAFETY:` 说明（`cargo xtask check-unsafe` 强制配平）；
+//! 1. 紧邻一条 `// SAFETY:` 说明（`cargo xtask gate unsafe` 强制配平）；
 //! 2. 计入 `unsafe.budget`（只允许减少或经显式批准增加）。
 //!
 //! 当前的 unsafe 集中在两处：外设 `instance()` 的获取（一次性、由 `board::init`

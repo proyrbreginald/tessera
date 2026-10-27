@@ -332,7 +332,7 @@ pub const STACK_SIZE: usize = STACK_SIZE_U32 as usize;
 /// 栈底（最低地址，**含**）：`0x2000_0000`，即 DTCM 的最底部。
 ///
 /// `imxrt-rt` 生成的链接脚本把 `.stack` 放在 DTCM 最底部、向量表紧随其后
-/// （`cargo xtask check-image` 从链接产物断言初始 SP = `0x2000_C000`）。
+/// （`cargo xtask gate image` 从链接产物断言初始 SP = `0x2000_C000`）。
 /// 这个值等于 [`DTCM`]`.base` 是**事实**，不是方便：栈底就是 DTCM 的下界 ——
 /// 那条事实由下面的编译期断言（在 `u32` 口径上）钉住。
 #[allow(clippy::as_conversions)]
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[test]
     fn stack_geometry_matches_the_linker_script() {
-        // `cargo xtask check-image` 从链接产物断言初始 SP = 0x2000_C000。
+        // `cargo xtask gate image` 从链接产物断言初始 SP = 0x2000_C000。
         // 这里把同一个事实钉在常量上：48 KiB 栈 + DTCM 最底部 = 0x2000_C000。
         // 上面两条测试走**地址口径**（`u32`，与 `Range`/DTCM 同宽）；这一段走
         // **对外口径**（`usize`，BSP 直接引用它们），并证明两层之间无损。

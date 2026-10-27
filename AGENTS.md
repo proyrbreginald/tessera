@@ -29,23 +29,19 @@
 
 | 命令 | 作用 |
 |---|---|
-| `cargo xtask verify` | 全量：静态门禁 + fmt/clippy + 主机测试 + 目标构建 + 产物断言 |
-| `cargo xtask gates` | 全部静态门禁汇总（不中断） |
-| `cargo xtask context` | 机器可读上下文（JSON） |
-| `cargo xtask test-host` / `lint-host` / `lint-target` | 主机测试 / 主机 lint / 目标 lint |
+| `cargo xtask verify` | 唯一全量入口（门禁 + fmt/clippy + 主机测试 + 构建 + 产物断言） |
+| `cargo xtask gates` | 18 项静态门禁汇总 |
+| `cargo xtask gate <name>` | 单跑一项门禁（名称见 `gates` 输出） |
+| `cargo xtask test-host` | 主机测试 |
 | `cargo xtask coverage` | 主机行覆盖率（阈值 90%） |
-| `cargo xtask check-layering` | 18 个纯逻辑 crate 的依赖闭包不含 `imxrt-*`/`cortex-m*`/`rtic` |
-| `cargo xtask check-capsules` | 插件 crate 不直接依赖 BSP/固件 |
-| `cargo xtask check-interrupt-priorities` | 中断任务优先级与预算表一致 |
-| `cargo xtask check-unsafe` | unsafe 配平与预算 |
-| `cargo xtask check-docs` | 文档数字/可达性/命令存在性 |
-| `cargo xtask check-memory` / `check-image` / `check-flash-map` / `check-size` / `check-code-placement` | 产物级断言 |
-| `cargo xtask check-fault-handlers` / `check-critical` / `check-compile-fail` | 故障向量 / 关中断入口 / 编译负例 |
-| `cargo xtask check-style` / `check-lint-headers` / `check-api-usage` / `check-gaps` | 风格 / lint 头 / 公开项 / 缺口 |
-| `cargo xtask trace` | 需求追溯矩阵（生成，勿手改） |
-| `cargo xtask tock-build` / `tock-flash` / `tock-verify` / `tock-sync-boot-header` | Tock（后续固定运行时，迁移中） |
+| `cargo xtask context` | 机器可读项目上下文（JSON） |
+| `cargo xtask setup` | 一次性建 `.venv`（pyocd/pyserial） |
+| `cargo xtask flash` / `flash --erase` | 构建+烧录 / 全片擦除+烧录 |
+| `cargo xtask monitor` / `bytecheck` / `test-target` | 串口时基检查 / 控制台逐字节 / 目标端自检 |
+| `cargo xtask soak --minutes N` | 长稳采集 |
+| `cargo xtask tock-build` / `tock-verify` / `tock-sync-boot-header` | Tock（后续固定运行时，迁移中） |
 
-真机与交付命令见 [构建与验证](docs/构建与验证.md)；**所有入口统一为 `cargo`/`cargo xtask`，仓库不使用 make**。
+**所有入口都是 cargo，仓库不使用 make。** 真机细节见 [构建与验证](docs/构建与验证.md)。
 
 ## 4. 代码地图
 
@@ -62,7 +58,7 @@
 ## 5. 常见坑（都踩过）
 
 - **不要在运行期写启动头**（偏移 0..8 KiB 只读；写坏只能 BOOT_MODE + 串口下载器救）；
-- 改分区布局/FS 磁盘格式必须 `bash scripts/flash.sh -e chip` 全片擦除，否则旧数据会被误读；
+- 改分区布局/FS 磁盘格式必须 `cargo xtask flash --erase` 全片擦除，否则旧数据会被误读；
 - FlexSPI 不要逐字节 `read_volatile`（会像死机）；改 FlexSPI 时钟必须同时重算 dummy；
 - 4 字节寻址不要退回 3 字节模式（越过 16 MiB 会静默别名，"擦日志区"可能擦掉启动头）；
 - MPU `RBAR` 区域号在 bits[3:0]、bit[4] 是 VALID（编码错误会让 8 次写全落 region0）；
