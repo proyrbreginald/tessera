@@ -1,0 +1,18 @@
+# 最小 Tock 板级 crate（Tessera RT1021 替换 RTIC 的可行性验证）
+[package]
+name = "tessera-rt1021"
+version.workspace = true
+authors.workspace = true
+build = "../build.rs"
+edition.workspace = true
+
+[dependencies]
+cortexm7 = { path = "../../arch/cortex-m7" }
+kernel = { path = "../../kernel" }
+imxrt10xx = { path = "../../chips/imxrt10xx" }
+
+[build-dependencies]
+tock_build_scripts = { path = "../build_scripts" }
+
+[lints]
+workspace = true

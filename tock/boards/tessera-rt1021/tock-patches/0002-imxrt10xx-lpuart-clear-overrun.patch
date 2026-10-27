@@ -1,0 +1,17 @@
+--- a/chips/imxrt10xx/src/lpuart.rs
++++ b/chips/imxrt10xx/src/lpuart.rs
+@@ -478,7 +478,13 @@
+     }
+ 
+     fn clear_overrun(&self) {
+-        self.registers.ctrl.modify(CTRL::ORIE::CLEAR);
++        // TESSERA-PATCH: 上游这里写的是 `CTRL::ORIE::CLEAR`，关的是"overrun 中断
++        // 使能"，并没有清 `STAT::OR`。`STAT.OR` 是写 1 清零（W1C）的粘滞标志，
++        // 所以一次 overrun 之后它会永远置位：此后每次 LPUART 中断都会再走一遍
++        // `handle_interrupt()` 末尾的 OR 分支，把回调里刚重挂上的接收缓冲再抢走
++        // 一次并回报 `OverrunError`。表现为接收节奏错乱、错误计数虚高。
++        // 正确的清法是往 `STAT.OR` 写 1（同文件 `clear_status()` 里也是这么做的）。
++        self.registers.stat.modify(STAT::OR::SET);
+     }
+ 
+     pub fn handle_interrupt(&self) {

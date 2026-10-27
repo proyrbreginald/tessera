@@ -1,0 +1,48 @@
+--- a/chips/imxrt10xx/src/lpuart.rs
++++ b/chips/imxrt10xx/src/lpuart.rs
+@@ -433,8 +433,23 @@
+     }
+ 
+     pub fn set_baud(&self) {
+-        // Set the Baud Rate Modulo Divisor
+-        self.registers.baud.modify(BAUD::SBR.val(139_u32));
++        // TESSERA-PATCH: RT1021 控制台时钟源是 24 MHz 晶振
++        // (`UartClockSelection::Oscillator`, podf=1)，不是 EVKB 的 PLL3 80 MHz。
++        // 上游这里按 80 MHz / 5 倍过采样硬编码 SBR=139
++        // (80e6 / 5 / 139 = 115107 Baud)。24 MHz 下必须改用 16 倍过采样 +
++        // SBR=13：24e6 / 16 / 13 = 115384 Baud，相对 115200 的误差 +0.16%
++        // （< 2%，在 LPUART 允许范围内）。
++        // OSR 字段值 15 表示过采样率 16（值 = 比率 - 1），必须和 SBR 一起改，
++        // 否则波特率会差 3 倍以上。
++        //
++        // TESSERA-PATCH: 同时清 BOTHEDGE。`configure()` 会无条件置 BOTHEDGE，
++        // 而 NXP 的 LPUART 只在 OSR=4..7 时才允许/需要双沿采样（imxrt-hal 的
++        // `Baud::compute` 也是按 `4 <= osr <= 7` 决定 bothedge）。这里 OSR=16，
++        // 必须清掉；清掉后与现有 Tessera 固件用 imxrt-hal 算出的配置等价：
++        // 24e6 / (8*26) 与 24e6 / (16*13) 都是 115384 Baud。
++        self.registers.baud.modify(
++            BAUD::OSR.val(0b1111_u32) + BAUD::SBR.val(13_u32) + BAUD::BOTHEDGE::CLEAR,
++        );
+     }
+ 
+     // for use by panic in io.rs
+@@ -828,11 +843,14 @@
+         // Enable Bothedge sampling
+         self.registers.baud.modify(BAUD::BOTHEDGE::SET);
+ 
+-        // Set Oversampling Ratio to 5 (the value written is -1)
+-        self.registers.baud.modify(BAUD::OSR.val(0b100_u32));
+-
+-        // Set the Baud Rate Modulo Divisor
+-        self.registers.baud.modify(BAUD::SBR.val(139_u32));
++        // TESSERA-PATCH: 过采样率由 5 改为 16（字段值 15 = 比率 - 1）。
++        // 原因见 `set_baud()`：RT1021 控制台时钟是 24 MHz 晶振，SBR=13 只在
++        // 16 倍过采样下才等于 115200（24e6 / 16 / 13 = 115384）。
++        self.registers.baud.modify(BAUD::OSR.val(0b1111_u32));
++
++        // TESSERA-PATCH: 分频值由 139（PLL3 80 MHz / 5x）改为 13
++        // （24 MHz 晶振 / 16x）。详见 `set_baud()`。
++        self.registers.baud.modify(BAUD::SBR.val(13_u32));
+ 
+         // Set bit count and parity mode
+         self.registers.baud.modify(BAUD::M10::CLEAR);

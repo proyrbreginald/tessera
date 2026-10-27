@@ -1,0 +1,21 @@
+# 本验证用 stable 工具链（Tock 默认配置里的 -Z emit-stack-sizes / build-std 是 nightly-only）。
+#
+# 注意：rustflags 必须挂在 [target.thumbv7em-none-eabihf] 而**不是** [build]。
+# 本仓库位于 tessera 工作区内，上层 /home/reginald/project/tessera/.cargo/config.toml
+# 已经为同一 triple 设了 `[target.thumbv7em-none-eabihf] rustflags = ["-Timxrt-link.x"]`；
+# cargo 的规则是 target 专属 rustflags 优先于 [build] rustflags，因此挂在 [build]
+# 下时本文件的 flags 会被上层整体覆盖（表现为 build script 报
+# "Incorrect build configuration"）。写成同一层级后，离 cwd 更近的本文件生效。
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+  "--cfg", "cfg_tock_buildflagssentinel",
+  "-C", "linker=rust-lld",
+  "-C", "linker-flavor=ld.lld",
+  "-C", "relocation-model=static",
+  "-C", "link-arg=-nmagic",
+  "-C", "link-arg=-icf=all",
+]
