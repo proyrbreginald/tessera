@@ -3468,7 +3468,6 @@ fn xtask_monitor() -> Result<(), String> {
 /// 控制台逐字节校验：复位 → 抓 15 秒 → 剥 ANSI 后逐条比对期望行与值级判据。
 fn xtask_bytecheck() -> Result<(), String> {
     let root = workspace_root();
-    let pyocd = resolve_pyocd();
     let mut port = open_serial()?;
     // 打开串口/复位之间存在竞态：横幅可能恰好落在"还没开始读"的窗口里。
     // 最多尝试两次复位；第一次没看到身份行就再来一次（此时读循环已经在跑）。

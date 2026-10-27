@@ -10,6 +10,8 @@ edition.workspace = true
 cortexm7 = { path = "../../arch/cortex-m7" }
 kernel = { path = "../../kernel" }
 imxrt10xx = { path = "../../chips/imxrt10xx" }
+board-support = { path = "../../../crates/board-support" }
+ports = { path = "../../../crates/ports" }
 
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }

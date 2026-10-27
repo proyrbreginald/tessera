@@ -17,7 +17,16 @@
 RTIC 依赖面很小：工作区 `rtic`、`firmware/Cargo.toml`、`firmware/src/device.rs`、
 `main.rs` 的 `#[rtic::app]` 与 `#[task(binds=LPUART1)]`、`#[task(binds=PIT)]`。
 
-## 1. 阶段 1：Tock 接管启动与 BSP
+## 1. 阶段 1：Tock 接管启动与 BSP（✅ 2026-10-27 已完成）
+
+**结果**：Tock 板级 main 已调用 `board_support::board::init()`（时钟 / PIT / SDRAM /
+控制台 / FlexSPI LUT），Tock 的 `InterruptService` 把 LPUART1/PIT 交给 BSP；内核 loop 中
+1 Hz 心跳与按行回显已真机通过：
+
+- `cargo xtask tock-verify`：✅ 启动横幅 / ✅ 内核 loop / ✅ 行回显；
+- `cargo xtask monitor`：心跳 `tock: beat uptime=…` 正常，时基漂移 ±0.03%（容差 ±2%）。
+
+> 本阶段仍未迁移终端/FS/日志命令（属阶段 3）；`bytecheck` 全量通过是阶段 1 之后的判据。
 
 **目标**：Tock 入口调用现有 `board_support::init()`，串口终端可用、心跳可见；
 生产固件仍为 RTIC（双轨，可回退）。
