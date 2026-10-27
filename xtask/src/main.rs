@@ -10,8 +10,8 @@
 //! 1. **宁可失败，不要静默通过**：解析不出来就是错误，绝不"跳过这一项"。
 //! 2. **产物级优先**：能对 ELF 断言的不对源码断言 —— 后者只证明代码写了什么，
 //!    前者证明**镜像里真的是什么**。
-//! 3. **零重依赖**：只依赖 `object`（真 ELF 解析）。少一个依赖，
-//!    就少一份需要论证的工具面（这与功能安全的目标一致）。
+//! 3. **依赖尽量少**：`object`（ELF 解析）、`serialport`（台架抓包）、`regex`（控制台逐字节
+//!    校验与心跳解析）。台架脚本已全部收进本 crate，仓库里不再有 bash/python 脚本。
 
 use std::collections::BTreeSet;
 
@@ -20,8 +20,11 @@ use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 纯逻辑 crate：依赖闭包里**不得**出现任何硬件相关 crate。
 const PURE_CRATES: &[&str] = &[
@@ -610,7 +613,25 @@ fn check_invocations(root: &Path, problems: &mut Vec<String>) -> Result<(), Stri
                 }
             }
 
-            // ② 仓库已统一到 cargo：文档里不得再引用 make 目标。
+            // ② 仓库里不得再出现 bash 命令（台架逻辑已全部收进 xtask）。
+            let mut rest = line;
+            while let Some(index) = rest.find("bash ") {
+                let tail = &rest[index + "bash ".len()..];
+                let token: String = tail
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.' || *ch == '/')
+                    .collect();
+                rest = &rest[index + "bash ".len()..];
+                if token.is_empty() {
+                    continue;
+                }
+                problems.push(format!(
+                    "{short}:{} 引用了 bash 命令 `bash {token}` —— 仓库已统一用 cargo，请改成对应的 `cargo xtask ...`",
+                    number + 1
+                ));
+            }
+
+            // ③ 仓库已统一到 cargo：文档里不得再引用 make 目标。
             let mut rest = line;
             while let Some(index) = rest.find("make ") {
                 let tail = &rest[index + "make ".len()..];
@@ -1338,30 +1359,7 @@ fn today_iso8601() -> String {
 
 
 
-/// 找出**带 pyserial 的 python**。
-///
-/// 与 `scripts/tool-paths.sh` 的 `resolve_pyocd_python` 同一策略：pyocd 与 pyserial
-/// 装在同一 venv 里，所以取 pyocd 旁边那个解释器；系统 `python3` 往往没有 pyserial
-/// （真机上就踩过：`ModuleNotFoundError: No module named 'serial'`）。
-#[must_use]
-fn resolve_python() -> String {
-    if let Ok(explicit) = std::env::var("BASE_PYTHON") {
-        if Path::new(&explicit).exists() {
-            return explicit;
-        }
-    }
-    if let Some(pyocd) = resolve_pyocd() {
-        if let Some(dir) = Path::new(&pyocd).parent() {
-            let sibling = dir.join("python");
-            if sibling.exists() {
-                return sibling.display().to_string();
-            }
-        }
-    }
-    "python3".to_string()
-}
-
-/// 找出 pyocd 可执行文件（顺序与 `scripts/tool-paths.sh` 一致）。
+/// 找出 pyocd 可执行文件（`PYOCD` 环境变量优先，其次本项目 `.venv` 与相邻项目 `.venv`）。
 #[must_use]
 fn resolve_pyocd() -> Option<String> {
     if let Ok(explicit) = std::env::var("PYOCD") {
@@ -1688,11 +1686,11 @@ fn main() {
         "test-host" => test_host(),
         "coverage" => coverage(),
         "context" => context(),
-        "setup" => run_script("scripts/setup-bench.sh", &[], "建 Python 虚拟环境"),
+        "setup" => xtask_setup(),
         "flash" => xtask_flash(),
         "reset" => xtask_reset(),
-        "monitor" => run_script("scripts/monitor.sh", &[], "抓串口并检查时基漂移"),
-        "bytecheck" => run_script("scripts/bytecheck.sh", &[], "控制台逐字节校验"),
+        "monitor" => xtask_monitor(),
+        "bytecheck" => xtask_bytecheck(),
         "test-target" => xtask_test_target(),
         "soak" => xtask_soak(),
         "tock-build" => tock_build(),
@@ -1769,7 +1767,7 @@ const COMMANDS: &[Subcommand] = &[
     Subcommand { name: "test-host", what: "主机测试（纯逻辑层）" },
     Subcommand { name: "coverage", what: "主机侧行覆盖率（阈值 90%）" },
     Subcommand { name: "context", what: "机器可读项目上下文（JSON）" },
-    Subcommand { name: "setup", what: "建 Python 虚拟环境（pyocd/pyserial）" },
+    Subcommand { name: "setup", what: "建 Python 虚拟环境（pyocd）" },
     Subcommand { name: "flash", what: "构建并烧录（加 --erase 全片擦除；改分区/FS 格式后必须）" },
     Subcommand { name: "reset", what: "复位目标板" },
     Subcommand { name: "monitor", what: "抓串口并检验时基漂移（±2%）" },
@@ -2496,7 +2494,7 @@ fn trace() -> Result<(), String> {
     // 生成追溯矩阵（人工不维护，避免与代码漂移）。
     let mut matrix = String::from(
         "# 需求追溯矩阵\n\n\
-         > **本文件由 `cargo xtask trace` 生成，请勿手改。**\n\
+         > **本文件由 `cargo xtask gate trace`（`verify` 也会跑）生成，请勿手改。**\n\
          > 手写的追溯矩阵一定会与代码漂移；生成它则永远与代码一致。\n\
          > 判定依据：需求编号是否出现在 Rust 源码中（测试名用下划线形式，如 `rt_1_...`）。\n\n\
          | 需求 | 覆盖状态 | 出现位置 |\n|------|----------|----------|\n",
@@ -3269,27 +3267,536 @@ fn run(command: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- 台架/交付（包 scripts，入口统一 cargo）
+// ---------------------------------------------------------------- 串口台架（纯 Rust，无脚本）
 
-/// 运行仓库内脚本（bash）。入口统一走 `cargo xtask`，脚本只承担台架工具调用。
-fn run_script(script: &str, args: &[&str], what: &str) -> Result<(), String> {
-    let root = workspace_root();
-    let path = root.join(script);
-    if !path.is_file() {
-        return Err(format!("找不到脚本：{script}"));
+/// 台架串口设备（`BASE_SERIAL` / `UART_ALIAS` 可覆盖）。
+fn serial_device() -> String {
+    std::env::var("BASE_SERIAL")
+        .or_else(|_| std::env::var("UART_ALIAS"))
+        .unwrap_or_else(|_| "/dev/pudu-debugger-16p-uart".to_string())
+}
+
+/// 打开 115200 8N1 串口（读超时 200 ms）。
+fn open_serial() -> Result<Box<dyn serialport::SerialPort>, String> {
+    serialport::new(serial_device(), 115200)
+        .timeout(Duration::from_millis(200))
+        .open()
+        .map_err(|error| format!("打开串口失败：{error}（检查接线/占用；`cargo xtask setup` 安装工具）"))
+}
+
+/// 剥离 ANSI 转义序列并做 UTF-8 容错解码（逐字节扫描，不依赖正则）。
+fn strip_ansi(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == 0x1b && raw.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < raw.len() {
+                let byte = raw[index];
+                index += 1;
+                if byte.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(raw[index]);
+        index += 1;
     }
-    let status = std::process::Command::new("bash")
-        .arg(&path)
-        .args(args)
-        .current_dir(&root)
-        .status()
-        .map_err(|error| format!("执行 {what} 失败：{error}"))?;
-    if !status.success() {
-        return Err(format!("{what}失败（见上方输出）"));
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 在后台线程复位板子（先开始抓包再复位，避免漏掉最早的行）。
+fn spawn_reset(pyocd: Option<String>) {
+    if let Some(pyocd) = pyocd {
+        thread::spawn(move || {
+            let _ = Command::new(pyocd)
+                .args(["reset", "--target", "mimxrt1020"])
+                .output();
+        });
     }
-    println!("[xtask] {what}通过");
+}
+
+/// 逐行读取直到 deadline；每一行剥 ANSI 后回调。
+fn read_lines_until(
+    port: &mut dyn serialport::SerialPort,
+    deadline: Instant,
+    mut on_line: impl FnMut(&str),
+) -> Result<(), String> {
+    let mut buffer = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(0) => thread::sleep(Duration::from_millis(5)),
+            Ok(count) => {
+                pending.extend_from_slice(&buffer[..count]);
+                while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=position).collect();
+                    let text = strip_ansi(&line);
+                    on_line(text.trim_end_matches(['\r', '\n']));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(format!("读串口失败：{error}")),
+        }
+    }
     Ok(())
 }
+
+/// 等终端就绪（启动报告结束）；返回是否在超时前看到就绪提示。
+fn wait_terminal_ready(port: &mut dyn serialport::SerialPort, seconds: f64) -> Result<bool, String> {
+    let mut ready = false;
+    read_lines_until(port, Instant::now() + Duration::from_secs_f64(seconds), |line| {
+        if line.contains("纯逻辑终端") || line.contains("未实现项用") {
+            ready = true;
+        }
+    })?;
+    Ok(ready)
+}
+
+/// 抓原始字节直到 deadline。
+fn capture_raw_until(
+    port: &mut dyn serialport::SerialPort,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut buffer = [0u8; 4096];
+    let mut raw = Vec::new();
+    while Instant::now() < deadline {
+        match port.read(&mut buffer) {
+            Ok(0) => thread::sleep(Duration::from_millis(5)),
+            Ok(count) => raw.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(format!("读串口失败：{error}")),
+        }
+    }
+    Ok(raw)
+}
+
+/// 建 Python 虚拟环境（一次性台架准备；只用于 pyocd，串口抓包已在 Rust 里）。
+fn xtask_setup() -> Result<(), String> {
+    let root = workspace_root();
+    let venv = root.join(".venv");
+    if !venv.is_dir() {
+        let status = Command::new("python3")
+            .args(["-m", "venv", ".venv"])
+            .current_dir(&root)
+            .status()
+            .map_err(|error| format!("执行 python3 -m venv 失败：{error}"))?;
+        if !status.success() {
+            return Err("创建 .venv 失败".to_string());
+        }
+    }
+    let pip = venv.join("bin/pip");
+    let status = Command::new(&pip)
+        .args(["install", "--disable-pip-version-check", "-q", "pyocd"])
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("执行 pip 失败：{error}"))?;
+    if !status.success() {
+        return Err("安装 pyocd 失败".to_string());
+    }
+    let output = Command::new(venv.join("bin/pyocd"))
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("执行 pyocd --version 失败：{error}"))?;
+    println!("[xtask] 台架工具就绪：{}", String::from_utf8_lossy(&output.stdout).trim());
+    Ok(())
+}
+
+/// 读串口并检验时基漂移（设备 uptime vs 主机时间，±2%）。
+fn xtask_monitor() -> Result<(), String> {
+    let pyocd = resolve_pyocd();
+    let mut port = open_serial()?;
+    let seconds = std::env::var("MONITOR_SECONDS")
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+        .unwrap_or(10.0);
+    spawn_reset(pyocd);
+    // 先等复位后的终端就绪，再发 `beat on`；否则命令会落在复位窗口里丢失。
+    wait_terminal_ready(&mut *port, 8.0)?;
+    port.write_all(b"beat on\n")
+        .map_err(|error| format!("写串口失败：{error}"))?;
+    let start = Instant::now();
+    let mut samples: Vec<(f64, f64)> = Vec::new();
+    let mut lines = 0usize;
+    let mut violations = 0usize;
+    let uptime = regex::Regex::new(r"uptime=(\d+)\.(\d{3})s").map_err(|error| error.to_string())?;
+    read_lines_until(&mut *port, start + Duration::from_secs_f64(seconds), |line| {
+        if line.is_empty() {
+            return;
+        }
+        lines += 1;
+        println!("{line}");
+        if let Some(captures) = uptime.captures(line) {
+            let secs: f64 = captures[1].parse().unwrap_or(0.0);
+            let millis: f64 = captures[2].parse().unwrap_or(0.0);
+            samples.push((secs + millis / 1000.0, start.elapsed().as_secs_f64()));
+            if samples.len() >= 3 {
+                let (device_previous, host_previous) = samples[samples.len() - 2];
+                let (device_now, host_now) = samples[samples.len() - 1];
+                let host_delta = host_now - host_previous;
+                if host_delta > 0.2 {
+                    let drift = ((device_now - device_previous) - host_delta) / host_delta * 100.0;
+                    println!("  → 漂移 {drift:+.3} % （容差 ±2%）");
+                    if drift.abs() > 2.0 {
+                        violations += 1;
+                    }
+                }
+            }
+        }
+    })?;
+    let _ = port.write_all(b"beat off\n");
+    if lines == 0 {
+        return Err("没有读到任何行：检查波特率、接线与复位".to_string());
+    }
+    if samples.len() < 3 {
+        return Err(format!(
+            "只读到 {} 条心跳：无法判定时基漂移（需要 ≥3 条，前 2 条预热）",
+            samples.len()
+        ));
+    }
+    if violations > 0 {
+        return Err(format!("时基漂移超差：{violations} 次（容差 ±2%）"));
+    }
+    println!(
+        "[xtask] monitor 通过：{} 条心跳（前 2 条预热）全部在 ±2% 内",
+        samples.len()
+    );
+    Ok(())
+}
+
+/// 控制台逐字节校验：复位 → 抓 15 秒 → 剥 ANSI 后逐条比对期望行与值级判据。
+fn xtask_bytecheck() -> Result<(), String> {
+    let root = workspace_root();
+    let pyocd = resolve_pyocd();
+    let mut port = open_serial()?;
+    // 打开串口/复位之间存在竞态：横幅可能恰好落在"还没开始读"的窗口里。
+    // 最多尝试两次复位；第一次没看到身份行就再来一次（此时读循环已经在跑）。
+    let mut text = String::new();
+    let mut raw = Vec::new();
+    let identity = regex::Regex::new(r"^tessera \d+\.\d+\.\d+\.\d+ · MIMXRT1021CAG4A",)
+        .map_err(|error| error.to_string())?;
+    for _ in 0..2 {
+        spawn_reset(resolve_pyocd());
+        raw = capture_raw_until(&mut *port, Instant::now() + Duration::from_secs(15))?;
+        text = strip_ansi(&raw).replace('\r', "");
+        if identity.is_match(&text) && text.contains("纯逻辑终端") {
+            break;
+        }
+    }
+    let _ = fs::write(workspace_root().join("tmp/bytecheck-last.txt"), &text);
+    println!("抓到 {} 字节（剥离 ANSI 后 {} 字符）", raw.len(), text.chars().count());
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // 横幅图形来自仓库根 banner.txt（保留行首空格）。
+    if let Ok(banner) = fs::read_to_string(root.join("banner.txt")) {
+        if let Some(first_line) = banner.lines().find(|line| !line.trim().is_empty()) {
+            let pattern = regex::Regex::new(&format!(
+                "(?m)^{}$",
+                regex::escape(first_line)
+            ))
+            .map_err(|error| error.to_string())?;
+            let ok = pattern.is_match(&text);
+            println!("  {} 启动横幅（来自 banner.txt）", if ok { "✅" } else { "❌" });
+            if !ok {
+                failures.push("启动横幅首行未出现".to_string());
+            }
+        }
+    }
+
+    const CHECKS: &[(&str, &str)] = &[
+        ("身份行（版本 + 芯片）", r"^tessera \d+\.\d+\.\d+\.\d+ · MIMXRT1021CAG4A · Cortex-M7 @396 MHz$"),
+        ("启动节", r"^\[启动\]$"),
+        ("SDRAM 上电自检", r"^  sdram post : \d+ ms · PASS · \d+ KiB · hold \d+/\d+$"),
+        ("平台节", r"^\[平台\]$"),
+        ("4 字节寻址", r"^  flash 4B   : PASS · \d+ MiB addressable（>16 MiB 未被别名）$"),
+        ("SDRAM 器件/时钟", r"^  sdram      : W9825G6KH-6I · \d+ MiB @0x[0-9a-f]+ · SEMC \d+ MHz$"),
+        ("文件系统挂载", r"^  fs         : mounted · \d+ × 64 KiB · \d+ files? · .+$"),
+        ("分配池自检", r"^  alloc      : OK · 小块 \d+/\d+ · 大块 \d+/\d+ · 拒绝布局 \d+ · 拒绝释放 \d+ · exhaust \d+$"),
+        ("DMA 池非缓存", r"^  dma        : pool 0x20210000\+64 KiB · non-cacheable PASS$"),
+        ("安全节", r"^\[安全\]$"),
+        ("MPU/cache 回读", r"^  mpu        : 8 regions verified · I-cache ON · D-cache ON$"),
+        ("栈余量", r"^  stack      : peak \d+ B / 48 KiB · headroom \d+ B \(\d+%\)$"),
+        ("复位原因", r"^  reset      : 0x[0-9a-f]{8} \[.+\] · last crash: .+$"),
+        ("实时节", r"^\[实时\]$"),
+        ("DWT 仪表", r"^  dwt        : running · CTRL=0x[0-9a-f]{8} DEMCR=0x[0-9a-f]{8} · rearm \d+$"),
+        ("Flash 读吞吐", r"^  flash rd : \d+ KiB/s（\d+ KiB / \d+ µs，checksum=0x[0-9a-f]+，cache ON）$"),
+        ("设备节", r"^\[设备\]$"),
+        ("设备身份", r"^  id         : [0-9a-f]{16}（候选，唯一性待手册确认）$"),
+        ("CAN loopback", r"^  can        : alive · PE \d+ Hz · \d+ bps · loopback PASS$"),
+        ("终端就绪", r"^纯逻辑终端：输入 `help` 查看命令，Tab 补全，上下键翻历史。$"),
+    ];
+    for (description, pattern) in CHECKS {
+        let compiled = regex::Regex::new(&format!("(?m){pattern}"))
+            .map_err(|error| format!("正则编译失败：{error}"))?;
+        let ok = compiled.is_match(&text);
+        println!("  {} {description}", if ok { "✅" } else { "❌" });
+        if !ok {
+            failures.push(format!("{description}（期望 /{pattern}/）"));
+        }
+    }
+
+    if text.contains("**FAIL**") {
+        failures.push("启动报告出现 **FAIL**（不允许的告警）".to_string());
+    }
+
+    let flash = regex::Regex::new(r"flash rd : (\d+) KiB/s").map_err(|error| error.to_string())?;
+    if let Some(captures) = flash.captures(&text) {
+        let kib_s: u64 = captures[1].parse().unwrap_or(0);
+        if (10_000..=120_000).contains(&kib_s) {
+            println!("  ✅ Flash 读吞吐 {kib_s} KiB/s 在诚实范围");
+        } else {
+            println!("  ❌ Flash 读吞吐 {kib_s} KiB/s 超出范围 [10000, 120000]");
+            failures.push(format!("Flash 读吞吐 {kib_s} KiB/s 超出诚实范围"));
+        }
+    }
+
+    let headroom = regex::Regex::new(r"headroom \d+ B \((\d+)%\)").map_err(|error| error.to_string())?;
+    if let Some(captures) = headroom.captures(&text) {
+        let percent: u64 = captures[1].parse().unwrap_or(100);
+        if percent < 30 {
+            println!("  ❌ 栈余量 {percent}% 低于硬下限 30%");
+            failures.push(format!("栈余量 {percent}% 低于硬下限 30%"));
+        }
+    }
+
+    if failures.is_empty() {
+        println!("\n[xtask] 控制台逐字节校验通过");
+        Ok(())
+    } else {
+        Err(format!("控制台逐字节校验失败：{} 项", failures.len()))
+    }
+}
+
+/// 目标端自检：复位 → `selftest` → 解析逐条结果。
+fn xtask_test_target() -> Result<(), String> {
+    let root = workspace_root();
+    let pyocd = resolve_pyocd();
+    let mut port = open_serial()?;
+    spawn_reset(pyocd);
+    let log_dir = root.join("tmp/target-tests");
+    fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let log_path = log_dir.join(format!("{stamp}.log"));
+    let mut log = String::new();
+
+    // 等启动报告结束（终端就绪后默认静默），然后一次性发送命令。
+    read_lines_until(&mut *port, Instant::now() + Duration::from_secs(8), |line| {
+        log.push_str(line);
+        log.push('\n');
+    })?;
+    port.write_all(b"selftest\n")
+        .map_err(|error| format!("写串口失败：{error}"))?;
+
+    let test_line =
+        regex::Regex::new(r"^test\s+(\S+)\s+\.\.\.\s+(ok|FAILED)\s*$").map_err(|error| error.to_string())?;
+    let end_line =
+        regex::Regex::new(r"^TEST-END passed=(\d+) failed=(\d+)\s*$").map_err(|error| error.to_string())?;
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut end: Option<(usize, usize)> = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut buffer = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    while Instant::now() < deadline && end.is_none() {
+        match port.read(&mut buffer) {
+            Ok(0) => thread::sleep(Duration::from_millis(5)),
+            Ok(count) => {
+                pending.extend_from_slice(&buffer[..count]);
+                while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=position).collect();
+                    let text = strip_ansi(&line);
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    log.push_str(text);
+                    log.push('\n');
+                    if let Some(captures) = test_line.captures(text) {
+                        results.push((captures[1].to_string(), &captures[2] == "ok"));
+                    } else if let Some(captures) = end_line.captures(text) {
+                        end = Some((captures[1].parse().unwrap_or(0), captures[2].parse().unwrap_or(0)));
+                        break;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(format!("读串口失败：{error}")),
+        }
+    }
+    fs::write(&log_path, &log).map_err(|error| error.to_string())?;
+
+    for (name, ok) in &results {
+        println!("  {} {name}", if *ok { "✅" } else { "❌" });
+    }
+    let Some((passed, failed)) = end else {
+        return Err(format!("超时/未看到 TEST-END（日志 {}）", log_path.display()));
+    };
+    println!(
+        "target-test: passed={passed} failed={failed}（日志 {}）",
+        log_path.display()
+    );
+    if failed > 0 || passed != results.len() || results.iter().any(|(_, ok)| !ok) {
+        return Err("目标端自检失败".to_string());
+    }
+    Ok(())
+}
+
+/// 长稳采集：心跳统计 + 复位/丢弃/实时/漂移判据；原始输出与摘要落 `tmp/soak/`。
+fn xtask_soak() -> Result<(), String> {
+    let root = workspace_root();
+    let args: Vec<String> = std::env::args().collect();
+    let minutes: f64 = args
+        .iter()
+        .skip_while(|argument| *argument != "--minutes")
+        .nth(1)
+        .and_then(|text| text.parse().ok())
+        .or_else(|| std::env::var("SOAK_MINUTES").ok().and_then(|text| text.parse().ok()))
+        .unwrap_or(30.0);
+    let no_reset = args.iter().any(|argument| argument == "--no-reset");
+    let pyocd = resolve_pyocd();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let out_dir = root.join(format!("tmp/soak/{stamp}"));
+    fs::create_dir_all(&out_dir).map_err(|error| error.to_string())?;
+    let raw_path = out_dir.join("console.txt");
+    let summary_path = out_dir.join("summary.json");
+
+    if !no_reset {
+        spawn_reset(pyocd);
+    }
+    let mut port = open_serial()?;
+    // 先等终端就绪，再开心跳（避免命令落在复位窗口里丢失）。
+    wait_terminal_ready(&mut *port, 8.0)?;
+    port.write_all(b"beat on\n")
+        .map_err(|error| format!("写串口失败：{error}"))?;
+    let beat = regex::Regex::new(
+        r"beat=(\d+) uptime=(\d+)\.(\d{3})s tick=(\d+) wdg_ok=(\d) txdrop=(\d+) rxdrop=(\d+) wfi=(\d+) dwt=(\w+) rearm=(\d+) fsq=(\d+)/(\d+)/(\d+)/(\d+) rt=(\w+) covr=(\d+)",
+    )
+    .map_err(|error| error.to_string())?;
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs_f64(minutes * 60.0);
+    let mut raw = String::new();
+    // [beat, uptime_s, tick, txdrop, rxdrop, wdg_ok, fsq_failed, rt_ok, dwt_ok]
+    let mut samples: Vec<[f64; 9]> = Vec::new();
+    let mut reboots = 0usize;
+    let mut faults = 0usize;
+    read_lines_until(&mut *port, deadline, |line| {
+        raw.push_str(line);
+        raw.push('\n');
+        if line.starts_with("tessera ") && line.contains("MIMXRT1021") {
+            reboots += 1;
+        }
+        if line.contains("FAULT") {
+            faults += 1;
+        }
+        if let Some(captures) = beat.captures(line) {
+            samples.push([
+                captures[1].parse().unwrap_or(0.0),
+                captures[2].parse::<f64>().unwrap_or(0.0)
+                    + captures[3].parse::<f64>().unwrap_or(0.0) / 1000.0,
+                captures[4].parse().unwrap_or(0.0),
+                captures[6].parse().unwrap_or(0.0),
+                captures[7].parse().unwrap_or(0.0),
+                captures[5].parse().unwrap_or(0.0),
+                captures[13].parse().unwrap_or(0.0),
+                f64::from(u8::from(&captures[15] == "ok")),
+                f64::from(u8::from(&captures[9] == "ok")),
+            ]);
+        }
+    })?;
+    let _ = port.write_all(b"beat off\n");
+    fs::write(&raw_path, &raw).map_err(|error| error.to_string())?;
+    if samples.len() < 4 {
+        return Err(format!(
+            "只读到 {} 条心跳（需要 ≥4）：串口无输出/复位失败/板子未从 Flash 启动",
+            samples.len()
+        ));
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if reboots > 1 {
+        problems.push(format!("运行期复位 {} 次", reboots - 1));
+    }
+    if faults > 0 {
+        problems.push(format!("故障 {faults} 次"));
+    }
+    let usable = if samples.len() > 3 { &samples[3..] } else { &samples[..] };
+    let txdrop: f64 = usable.iter().map(|sample| sample[3]).sum();
+    let rxdrop: f64 = usable.iter().map(|sample| sample[4]).sum();
+    if txdrop > 0.0 {
+        problems.push(format!("控制台发送丢弃 {txdrop} B"));
+    }
+    if rxdrop > 0.0 {
+        problems.push(format!("控制台接收丢弃 {rxdrop} B"));
+    }
+    if usable.iter().any(|sample| sample[5] == 0.0) {
+        problems.push("运行期 wdg_ok=0（健康位未到齐）".to_string());
+    }
+    if usable.iter().any(|sample| sample[6] > 0.0) {
+        problems.push("文件系统写队列出现失败/拒绝".to_string());
+    }
+    if usable.iter().any(|sample| sample[7] == 0.0) {
+        problems.push("运行期出现 rt=VIOLATION/none".to_string());
+    }
+    if usable.iter().any(|sample| sample[8] == 0.0) {
+        problems.push("运行期出现 dwt=DEAD".to_string());
+    }
+    let mut drift = None;
+    let mut tick_rate = None;
+    if usable.len() >= 2 {
+        let first = usable[0];
+        let last = usable[usable.len() - 1];
+        let host_delta = (last[0] - first[0]).max(0.0);
+        let device_delta = last[1] - first[1];
+        if host_delta > 0.0 {
+            let value = (device_delta - host_delta) / host_delta * 100.0;
+            drift = Some(value);
+            if value.abs() > 2.0 {
+                problems.push(format!("时基漂移 {value:+.3}% 超出 ±2%"));
+            }
+        }
+        if device_delta > 0.0 {
+            let value = (last[2] - first[2]) / device_delta;
+            tick_rate = Some(value);
+            if (value - 1000.0).abs() > 20.0 {
+                problems.push(format!("节拍频率 {value:.1} Hz 超出 1000±2%"));
+            }
+        }
+    }
+    let summary = format!(
+        "{{\n  \"duration_minutes\": {minutes},\n  \"samples\": {},\n  \"reboots\": {},\n  \"faults\": {},\n  \"txdrop_total\": {txdrop},\n  \"rxdrop_total\": {rxdrop},\n  \"drift_percent\": {},\n  \"tick_rate_hz\": {},\n  \"problems\": [{}],\n  \"raw\": \"{}\"\n}}\n",
+        samples.len(),
+        reboots.saturating_sub(1),
+        faults,
+        drift.map(|value| format!("{value:.3}")).unwrap_or_else(|| "null".to_string()),
+        tick_rate.map(|value| format!("{value:.1}")).unwrap_or_else(|| "null".to_string()),
+        problems.iter().map(|problem| format!("\"{problem}\"")).collect::<Vec<_>>().join(", "),
+        raw_path.display()
+    );
+    fs::write(&summary_path, summary).map_err(|error| error.to_string())?;
+    println!("soak: {} 条心跳 · {minutes} min", samples.len());
+    if let Some(value) = drift {
+        println!("  漂移 : {value:+.3}%");
+    }
+    if let Some(value) = tick_rate {
+        println!("  节拍 : {value:.1} Hz");
+    }
+    println!("  摘要 : {}", summary_path.display());
+    if problems.is_empty() {
+        println!("[xtask] soak 通过：无复位/无丢弃/漂移在容差内");
+        Ok(())
+    } else {
+        for problem in &problems {
+            println!("  - {problem}");
+        }
+        Err(format!("soak 失败：{} 项", problems.len()))
+    }
+}
+
+// ---------------------------------------------------------------- 台架与交付（纯 Rust；无脚本）
 
 /// 构建生产固件（release）。
 fn build_firmware() -> Result<(), String> {
@@ -3304,52 +3811,8 @@ fn build_firmware() -> Result<(), String> {
     Ok(())
 }
 
-/// 静态检查：fmt + 目标/主机 clippy。
-
-/// 构建 + 产物布局断言。
-
-/// 构建 + 体积断言。
-
-/// 构建 + 生成 `.bin`/`.hex` 交付物（工具链自带 llvm-objcopy）。
-
-/// 烧录 + 抓串口。
-
-/// 长稳采集（`--minutes N`，默认 30）。
-fn xtask_soak() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
-    let minutes = args
-        .iter()
-        .skip_while(|argument| *argument != "--minutes")
-        .nth(1)
-        .cloned()
-        .or_else(|| std::env::var("SOAK_MINUTES").ok())
-        .unwrap_or_else(|| "30".to_string());
-    let root = workspace_root();
-    let status = std::process::Command::new(resolve_python())
-        .arg(root.join("scripts/soak.py"))
-        .args(["--minutes", &minutes])
-        .current_dir(&root)
-        .status()
-        .map_err(|error| format!("执行长稳采集失败：{error}"))?;
-    if !status.success() {
-        return Err("长稳采集失败".to_string());
-    }
-    Ok(())
-}
 
 /// 目标端自检。
-fn xtask_test_target() -> Result<(), String> {
-    let root = workspace_root();
-    let status = std::process::Command::new(resolve_python())
-        .arg(root.join("scripts/target_test.py"))
-        .current_dir(&root)
-        .status()
-        .map_err(|error| format!("执行目标端自检失败：{error}"))?;
-    if !status.success() {
-        return Err("目标端自检失败".to_string());
-    }
-    Ok(())
-}
 
 /// 构建并烧录固件（Rust 直接调用 pyocd；`--erase` 全片擦除）。
 fn xtask_flash() -> Result<(), String> {
@@ -3461,39 +3924,29 @@ fn tock_flash() -> Result<(), String> {
 /// 2. 输出包含 `tock: kernel_loop running`；
 /// 3. 逐字节（20 ms/字节）发送一行后，输出包含该行的 `rx line(NB)` 回显。
 fn tock_verify() -> Result<(), String> {
+    let mut port = open_serial()?;
     tock_flash()?;
-    let serial =
-        std::env::var("BASE_SERIAL").unwrap_or_else(|_| "/dev/pudu-debugger-16p-uart".to_string());
-    let pyocd = resolve_pyocd().unwrap_or_else(|| "pyocd".to_string());
-    let python = resolve_python();
-    let script = format!(
-        "import serial,time,subprocess,threading\n\
-         p=serial.Serial('{serial}',115200,timeout=0.2)\n\
-         p.reset_input_buffer()\n\
-         threading.Thread(target=lambda: subprocess.run(['{pyocd}','reset','--target','mimxrt1020'],capture_output=True),daemon=True).start()\n\
-         raw=b''\n\
-         end=time.time()+4\n\
-         while time.time()<end:\n\
-         \x20   raw+=p.read(65536)\n\
-         for ch in b'TOCK-VERIFY\\n':\n\
-         \x20   p.write(bytes([ch])); time.sleep(0.02)\n\
-         time.sleep(0.7)\n\
-         end=time.time()+1.5\n\
-         while time.time()<end:\n\
-         \x20   raw+=p.read(65536)\n\
-         print(raw.decode('utf-8','replace'))\n"
-    );
-    let output = std::process::Command::new(&python)
-        .args(["-c", &script])
-        .output()
-        .map_err(|error| format!("执行串口抓包失败（{python}）：{error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "串口抓包失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    // 烧录结束与串口开始读之间有竞态：横幅可能已经打印完。最多两次"复位+抓包"。
+    let mut text = String::new();
+    for _ in 0..2 {
+        spawn_reset(resolve_pyocd());
+        text = strip_ansi(&capture_raw_until(&mut *port, Instant::now() + Duration::from_secs(6))?);
+        if text.contains("tock: tessera-rt1021 kernel boot")
+            && text.contains("tock: kernel_loop running")
+        {
+            break;
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    // 逐字节慢发，避免 1 B RX FIFO 丢字节。
+    for byte in b"TOCK-VERIFY\n" {
+        port.write_all(&[*byte])
+            .map_err(|error| format!("写串口失败：{error}"))?;
+        thread::sleep(Duration::from_millis(20));
+    }
+    text.push_str(&strip_ansi(&capture_raw_until(
+        &mut *port,
+        Instant::now() + Duration::from_millis(1500),
+    )?));
     let checks = [
         ("启动横幅", text.contains("tock: tessera-rt1021 kernel boot")),
         ("内核 loop", text.contains("tock: kernel_loop running")),

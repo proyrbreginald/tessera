@@ -17,11 +17,11 @@ cargo build --release       # 只构建固件 ELF（默认 target 就是固件�
 cargo xtask context         # 机器可读项目上下文（crate/门禁/缺口/预算/最近测试）
 ```
 
-真机（需要台架 pyocd/pyserial；详见 [构建与验证](docs/构建与验证.md)）：
+真机（需要台架 pyocd；详见 [构建与验证](docs/构建与验证.md)）：
 
 ```bash
 cargo xtask flash --erase   # 全片擦除 + 烧录（改分区/FS 格式后必须）
-bash scripts/read_console.py --seconds 5   # 看串口
+cargo xtask monitor              # 抓串口并检查时基漂移
 cargo xtask bytecheck                  # 控制台逐字节校验（改时钟/中断后必跑）
 cargo xtask test-target                # 目标端自检 5 项
 ```
@@ -32,7 +32,7 @@ cargo xtask test-target                # 目标端自检 5 项
 crates/       生产固件 + 纯逻辑层：20 个成员 crate（18 个纯逻辑，可主机测试）
 tock/         后续固定运行时（vendored Tock 2.3.0 裁剪版 + 本地板级 crate）
 docs/         核心文档（重构后的精简版）
-scripts/      台架/烧录/抓包脚本（bash）
+
 xtask/        构建与门禁（Rust，独立工作区；不是成员 crate）
 tests/        主机集成测试与编译失败负例
 ```

@@ -35,7 +35,7 @@
 | `cargo xtask test-host` | 主机测试 |
 | `cargo xtask coverage` | 主机行覆盖率（阈值 90%） |
 | `cargo xtask context` | 机器可读项目上下文（JSON） |
-| `cargo xtask setup` | 一次性建 `.venv`（pyocd/pyserial） |
+| `cargo xtask setup` | 一次性建 `.venv`（pyocd） |
 | `cargo xtask flash` / `flash --erase` | 构建+烧录 / 全片擦除+烧录 |
 | `cargo xtask monitor` / `bytecheck` / `test-target` | 串口时基检查 / 控制台逐字节 / 目标端自检 |
 | `cargo xtask soak --minutes N` | 长稳采集 |

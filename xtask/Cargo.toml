@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+# 串口抓包（monitor/bytecheck/test-target/soak）——把台架脚本收进 xtask。
+serialport = { version = "4.9", default-features = false }
+# 控制台逐字节校验/心跳解析用的正则。
+regex = "1"
 # 唯一的外部依赖：真 ELF 解析。产物级断言必须基于**链接后的镜像**，
 # 而不是基于源码里的结构体 —— 前者才能证明"这些值真的落到了镜像里"。
 object = { version = "0.36", default-features = false, features = ["read", "std"] }
