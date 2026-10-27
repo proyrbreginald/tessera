@@ -1,0 +1,38 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2022.
+
+//! Utility for creating non-volatile storage regions.
+
+/// Allocates space in the kernel image for on-chip non-volatile storage.
+///
+/// Storage volumes are placed after the kernel code and before relocated
+/// variables (those copied into RAM on boot). They are placed in a section
+/// called `.storage`.
+///
+/// Non-volatile storage abstractions can then refer to the block of allocate
+/// flash in terms of the name of the volume. For example,
+///
+/// ```ignore
+/// storage_volume!(LOG, 32);
+/// ```
+///
+/// will allocate 32kB of space in the flash and define a symbol `LOG` at the
+/// start address of that flash region. The intention is that storage
+/// abstractions can then be passed this address and size to initialize their
+/// state. The default Tock linker script makes sure that the `.storage` section
+/// is aligned on a 512-byte boundary and the next section is aligned as well.
+#[macro_export]
+macro_rules! storage_volume {
+    ($N:ident, $kB:expr $(,)?) => {
+        // This section attribute is only applied when targeting bare-metal
+        // (`target_os = "none"`). Host builds (e.g. tests, clippy, doc) use
+        // object formats (Mach-O, PE, ...) that reject a bare section name
+        // like this, yielding errors such as: `mach-o section specifier
+        // requires a segment and section separated by a comma`.
+        #[cfg_attr(target_os = "none", unsafe(link_section = ".storage"))]
+        #[used]
+        #[unsafe(no_mangle)]
+        pub static $N: [u8; $kB * 1024] = [0x00; $kB * 1024];
+    };
+}

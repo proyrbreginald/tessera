@@ -2102,6 +2102,10 @@ fn main() {
         "gates" => gates(),
         "context" => context(),
         "bench" => bench(),
+        "tock-build" => tock_build(),
+        "tock-flash" => tock_flash(),
+        "tock-verify" => tock_verify(),
+        "tock-sync-boot-header" => tock_sync_boot_header(),
         "check-compile-fail" => check_compile_fail(),
         "trace" => trace(),
         "verify" => verify(),
@@ -2277,6 +2281,26 @@ const COMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "bench",
         what: "真机基准与基线回归（--record 采集，--from-file 离线取数）",
+        check: None,
+    },
+    Subcommand {
+        name: "tock-build",
+        what: "构建 runtime/tock 下的最小 Tock 镜像（实验性，不参与生产固件）",
+        check: None,
+    },
+    Subcommand {
+        name: "tock-flash",
+        what: "构建并全片擦除烧录 Tock 镜像（需要台架）",
+        check: None,
+    },
+    Subcommand {
+        name: "tock-verify",
+        what: "构建→烧录→串口验证 Tock 镜像（启动横幅 + 行回显）",
+        check: None,
+    },
+    Subcommand {
+        name: "tock-sync-boot-header",
+        what: "从生产固件 ELF 重新生成 Tock 板级 crate 的 8 KiB 启动头（FCB+IVT）",
         check: None,
     },
 ];
@@ -3766,6 +3790,222 @@ fn run(command: &str, args: &[&str]) -> Result<(), String> {
             args.join(" ")
         ));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- Tock（实验性）
+
+/// 板级 crate 目录（作为 cargo 工作目录，才能取到板级 `.cargo/config.toml`）。
+const TOCK_BOARD_DIR: &str = "runtime/tock/boards/tessera-rt1021";
+/// 构建产物（cargo 工作区 target 目录）。
+const TOCK_ELF: &str = "runtime/tock/target/thumbv7em-none-eabihf/release/tessera-rt1021";
+
+/// 构建最小 Tock 镜像（`cargo build --release`，不用 make/脚本）。
+fn tock_build() -> Result<(), String> {
+    let root = workspace_root();
+    let board = root.join(TOCK_BOARD_DIR);
+    if !board.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "找不到 Tock 板级 crate：{}（runtime/tock 未入仓？）",
+            board.display()
+        ));
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&board)
+        .status()
+        .map_err(|error| format!("执行 cargo 失败：{error}"))?;
+    if !status.success() {
+        return Err("Tock 镜像构建失败（见上方 cargo 输出）".to_string());
+    }
+    let elf = root.join(TOCK_ELF);
+    if !elf.is_file() {
+        return Err(format!("构建结束但找不到 ELF：{}", elf.display()));
+    }
+    println!("[xtask] tock-build 完成：{}", elf.display());
+    Ok(())
+}
+
+/// 构建并烧录 Tock 镜像（全片擦除；会清掉板上文件系统）。
+fn tock_flash() -> Result<(), String> {
+    tock_build()?;
+    let root = workspace_root();
+    let elf = root.join(TOCK_ELF);
+    let pyocd = resolve_pyocd().ok_or(
+        "找不到 pyocd：先跑一次台架准备（见 docs/04-开发/台架准备与排障.md），或设置 PYOCD",
+    )?;
+    let status = std::process::Command::new(&pyocd)
+        .args([
+            "load",
+            "--target",
+            "mimxrt1020",
+            "--format",
+            "elf",
+            "-e",
+            "chip",
+        ])
+        .arg(&elf)
+        .status()
+        .map_err(|error| format!("执行 pyocd 失败：{error}"))?;
+    if !status.success() {
+        return Err("pyocd 烧录失败".to_string());
+    }
+    println!("[xtask] tock-flash 完成：已烧录 {}", elf.display());
+    Ok(())
+}
+
+/// 构建 → 全片擦除烧录 → 串口验证（启动横幅 + 慢速行回显）。
+///
+/// 验证判据（失败即返回错误）：
+/// 1. 输出包含 `tock: tessera-rt1021 kernel boot`；
+/// 2. 输出包含 `tock: kernel_loop running`；
+/// 3. 逐字节（20 ms/字节）发送一行后，输出包含该行的 `rx line(NB)` 回显。
+fn tock_verify() -> Result<(), String> {
+    tock_flash()?;
+    let serial =
+        std::env::var("BASE_SERIAL").unwrap_or_else(|_| "/dev/pudu-debugger-16p-uart".to_string());
+    let pyocd = resolve_pyocd().unwrap_or_else(|| "pyocd".to_string());
+    let python = resolve_python();
+    let script = format!(
+        "import serial,time,subprocess,threading\n\
+         p=serial.Serial('{serial}',115200,timeout=0.2)\n\
+         p.reset_input_buffer()\n\
+         threading.Thread(target=lambda: subprocess.run(['{pyocd}','reset','--target','mimxrt1020'],capture_output=True),daemon=True).start()\n\
+         raw=b''\n\
+         end=time.time()+4\n\
+         while time.time()<end:\n\
+         \x20   raw+=p.read(65536)\n\
+         for ch in b'TOCK-VERIFY\\n':\n\
+         \x20   p.write(bytes([ch])); time.sleep(0.02)\n\
+         time.sleep(0.7)\n\
+         end=time.time()+1.5\n\
+         while time.time()<end:\n\
+         \x20   raw+=p.read(65536)\n\
+         print(raw.decode('utf-8','replace'))\n"
+    );
+    let output = std::process::Command::new(&python)
+        .args(["-c", &script])
+        .output()
+        .map_err(|error| format!("执行串口抓包失败（{python}）：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "串口抓包失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let checks = [
+        ("启动横幅", text.contains("tock: tessera-rt1021 kernel boot")),
+        ("内核 loop", text.contains("tock: kernel_loop running")),
+        ("行回显", text.contains("rx line(11B): TOCK-VERIFY")),
+    ];
+    let mut failed = Vec::new();
+    for (name, ok) in checks {
+        println!("  {} {}", if ok { "✅" } else { "❌" }, name);
+        if !ok {
+            failed.push(name);
+        }
+    }
+    if !failed.is_empty() {
+        println!("\n---- 原始串口输出 ----\n{text}\n----------------------");
+        return Err(format!("Tock 验证失败：{}", failed.join("、")));
+    }
+    println!("[xtask] tock-verify 通过：Tock 内核启动 + 中断驱动行回显");
+    Ok(())
+}
+
+
+/// 从生产固件 ELF 同步 Tock 板级 crate 的 8 KiB 启动头（FCB + IVT）。
+///
+/// 为什么需要它：`boot_hdr.bin` 是**构建输入源文件**（不是构建产物），
+/// 内容必须与生产固件的启动头逐字节一致；生产侧改启动头（FCB/IVT/分区）后，
+/// 用本命令重新生成并跑 `cargo xtask tock-verify`，避免两份事实漂移。
+fn tock_sync_boot_header() -> Result<(), String> {
+    let root = workspace_root();
+    // 1) 构建生产固件（Tessera 默认 target 就是 firmware target）。
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("执行 cargo 失败：{error}"))?;
+    if !status.success() {
+        return Err("生产固件构建失败".to_string());
+    }
+    let firmware = root.join("target/thumbv7em-none-eabihf/release/firmware");
+    if !firmware.is_file() {
+        return Err(format!("找不到生产固件 ELF：{}", firmware.display()));
+    }
+
+    // 2) 找工具链自带的 llvm-objcopy（与 `check-*` 门禁同一来源，不依赖 PATH）。
+    let sysroot = String::from_utf8(
+        std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .map_err(|error| format!("执行 rustc 失败：{error}"))?
+            .stdout,
+    )
+    .map_err(|error| format!("rustc sysroot 不是 UTF-8：{error}"))?
+    .trim()
+    .to_string();
+    let rustlib = Path::new(&sysroot).join("lib/rustlib");
+    let mut objcopy: Option<PathBuf> = None;
+    for entry in fs::read_dir(&rustlib).map_err(|error| error.to_string())? {
+        let candidate = entry
+            .map_err(|error| error.to_string())?
+            .path()
+            .join("bin/llvm-objcopy");
+        if candidate.is_file() {
+            objcopy = Some(candidate);
+            break;
+        }
+    }
+    let objcopy = objcopy.ok_or("工具链里找不到 llvm-objcopy（需要 llvm-tools 组件）")?;
+
+    // 3) ELF → 二进制，取前 8192 B。
+    let tmp_dir = root.join("tmp");
+    fs::create_dir_all(&tmp_dir).map_err(|error| error.to_string())?;
+    let raw = tmp_dir.join("tock-boot-header.bin");
+    let status = std::process::Command::new(&objcopy)
+        .args(["-O", "binary"])
+        .arg(&firmware)
+        .arg(&raw)
+        .status()
+        .map_err(|error| format!("执行 llvm-objcopy 失败：{error}"))?;
+    if !status.success() {
+        return Err("llvm-objcopy 转换失败".to_string());
+    }
+    let bytes = fs::read(&raw).map_err(|error| error.to_string())?;
+    let header = bytes
+        .get(..8192)
+        .ok_or("生产固件二进制不足 8192 B，无法提取启动头")?;
+    // 4) 自检：FCB tag + IVT magic/entry（与硬件启动约束一致，失败就不要写入）。
+    if header.get(..4) != Some(b"FCFB") {
+        return Err("生产固件偏移 0 不是 FCFB（启动头异常）".to_string());
+    }
+    let ivt_magic = u32::from_le_bytes(
+        header
+            .get(0x1000..0x1004)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or("读不到 IVT magic")?,
+    );
+    let ivt_entry = u32::from_le_bytes(
+        header
+            .get(0x1004..0x1008)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or("读不到 IVT entry")?,
+    );
+    if ivt_magic != 0x4020_00D1 || ivt_entry != 0x6000_2000 {
+        return Err(format!(
+            "IVT 自检失败：magic={ivt_magic:#010x} entry={ivt_entry:#010x}（期望 0x402000d1 / 0x60002000）"
+        ));
+    }
+    let target = root.join("runtime/tock/boards/tessera-rt1021/boot_hdr.bin");
+    fs::write(&target, header).map_err(|error| error.to_string())?;
+    println!(
+        "[xtask] tock-sync-boot-header 完成：{}（FCB + IVT entry=0x60002000）",
+        target.display()
+    );
+    println!("        下一步：cargo xtask tock-verify");
     Ok(())
 }
 

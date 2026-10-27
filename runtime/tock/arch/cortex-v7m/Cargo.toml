@@ -1,0 +1,16 @@
+# Licensed under the Apache License, Version 2.0 or the MIT License.
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright Tock Contributors 2024.
+
+[package]
+name = "cortexv7m"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+
+[dependencies]
+kernel = { path = "../../kernel" }
+cortexm = { path = "../cortex-m" }
+
+[lints]
+workspace = true

@@ -1,0 +1,2753 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2022.
+
+//! Tock default Process implementation.
+//!
+//! `ProcessStandard` is an implementation for a userspace process running on
+//! the Tock kernel.
+
+use core::cell::Cell;
+use core::cmp;
+use core::fmt::Write;
+use core::mem::MaybeUninit;
+use core::num::NonZeroU32;
+use core::ptr::NonNull;
+use core::{mem, ptr, slice, str};
+
+use crate::collections::queue::Queue;
+use crate::collections::ring_buffer::RingBuffer;
+use crate::config;
+use crate::debug;
+use crate::errorcode::ErrorCode;
+use crate::init_uninit_struct;
+use crate::kernel::Kernel;
+use crate::platform::chip::Chip;
+use crate::platform::mpu::{self, MPU};
+use crate::process::ProcessBinary;
+use crate::process::{BinaryVersion, ReturnArguments};
+use crate::process::{Error, FunctionCall, FunctionCallSource, Process, Task};
+use crate::process::{FaultAction, ProcessCustomGrantIdentifier, ProcessId};
+use crate::process::{ProcessAddresses, ProcessSizes, ShortId};
+use crate::process::{State, StoppedState};
+use crate::process_checker::AcceptedCredential;
+use crate::process_loading::ProcessLoadError;
+use crate::process_policies::ProcessFaultPolicy;
+use crate::process_policies::ProcessStandardStoragePermissionsPolicy;
+use crate::processbuffer::{ReadOnlyProcessBuffer, ReadWriteProcessBuffer};
+use crate::storage_permissions::StoragePermissions;
+use crate::syscall::{self, Syscall, SyscallReturn, UserspaceKernelBoundary};
+use crate::upcall::UpcallId;
+use crate::utilities::capability_ptr::{CapabilityPtr, CapabilityPtrPermissions};
+use crate::utilities::cells::{MapCell, NumericCellExt, OptionalCell};
+
+use tock_tbf::types::CommandPermissions;
+
+/// Gets a mutable (unique) reference to the contained value.
+///
+/// TODO: this is copied from the standard library, where it is available under
+/// the `maybe_uninit_slice` nightly feature. Remove and switch to the core
+/// library variant once that is stable.
+///
+/// # Safety
+///
+/// Calling this when the content is not yet fully initialized causes undefined
+/// behavior: it is up to the caller to guarantee that every `MaybeUninit<T>` in the
+/// slice really is in an initialized state. For instance, `.assume_init_mut()` cannot
+/// be used to initialize a `MaybeUninit` slice.
+#[inline(always)]
+const unsafe fn maybe_uninit_slice_assume_init_mut<T>(src: &mut [MaybeUninit<T>]) -> &mut [T] {
+    // SAFETY: similar to safety notes for `slice_get_ref`, but we have a
+    // mutable reference which is also guaranteed to be valid for writes.
+    #[allow(clippy::ref_as_ptr)]
+    unsafe {
+        &mut *(src as *mut [MaybeUninit<T>] as *mut [T])
+    }
+}
+
+/// Divides one mutable raw slice into two at an index.
+///
+/// This method implementation is copied from the standard library, where it is
+/// available with `raw_slice_split` nightly feature. TODO: switch to the
+/// standard library function once that is stable.
+///
+/// The first will contain all indices from `[0, mid)` (excluding the index
+/// `mid` itself) and the second will contain all indices from `[mid, len)`
+/// (excluding the index `len` itself).
+///
+/// # Panics
+///
+/// Panics if `mid > len`.
+///
+/// # Safety
+///
+/// `mid` must be [in-bounds] of the underlying [allocation].  Which means
+/// `self` must be dereferenceable and span a single allocation that is at least
+/// `mid * size_of::<T>()` bytes long. Not upholding these requirements is
+/// *[undefined behavior]* even if the resulting pointers are not used.
+///
+/// Since `len` being in-bounds is not a safety invariant of `*mut [T]` the
+/// safety requirements of this method are the same as for
+/// [`split_at_mut_unchecked`].  The explicit bounds check is only as useful as
+/// `len` is correct.
+///
+/// [`split_at_mut_unchecked`]: https://doc.rust-lang.org/stable/std/primitive.pointer.html#method.split_at_mut_unchecked
+/// [in-bounds]: https://doc.rust-lang.org/stable/std/primitive.pointer.html#method.add-1
+/// [allocation]: https://doc.rust-lang.org/stable/std/ptr/index.html#allocation
+/// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
+unsafe fn raw_slice_split_at_mut<T>(slice: *mut [T], mid: usize) -> (*mut [T], *mut [T]) {
+    assert!(mid <= slice.len());
+
+    let len = slice.len();
+    let ptr = slice.cast::<T>();
+
+    // SAFETY: Caller must pass a valid pointer and an index that is in-bounds.
+    let tail = unsafe { ptr.add(mid) };
+    (
+        core::ptr::slice_from_raw_parts_mut(ptr, mid),
+        core::ptr::slice_from_raw_parts_mut(tail, len - mid),
+    )
+}
+
+/// Interface supported by [`ProcessStandard`] for recording debug information.
+///
+/// This trait provides flexibility to users of [`ProcessStandard`] to determine
+/// how debugging information should be recorded, or if debugging information
+/// should be recorded at all.
+///
+/// Platforms that want to only maintain certain debugging information can
+/// implement only part of this trait.
+///
+/// Tock provides a default implementation of this trait on the `()` type.
+/// Kernels that wish to use [`ProcessStandard`] but do not need process-level
+/// debugging information can use `()` as the `ProcessStandardDebug` type.
+pub trait ProcessStandardDebug: Default {
+    /// Record the address in flash the process expects to start at.
+    fn set_fixed_address_flash(&self, address: u32);
+    /// Get the address in flash the process expects to start at, if it was
+    /// recorded.
+    fn get_fixed_address_flash(&self) -> Option<u32>;
+    /// Record the address in RAM the process expects to start at.
+    fn set_fixed_address_ram(&self, address: u32);
+    /// Get the address in RAM the process expects to start at, if it was
+    /// recorded.
+    fn get_fixed_address_ram(&self) -> Option<u32>;
+    /// Record the address where the process placed its heap.
+    fn set_app_heap_start_pointer(&self, ptr: *const u8);
+    /// Get the address where the process placed its heap, if it was recorded.
+    fn get_app_heap_start_pointer(&self) -> Option<*const u8>;
+    /// Record the address where the process placed its stack.
+    fn set_app_stack_start_pointer(&self, ptr: *const u8);
+    /// Get the address where the process placed its stack, if it was recorded.
+    fn get_app_stack_start_pointer(&self) -> Option<*const u8>;
+    /// Update the lowest address that the process's stack has reached.
+    fn set_app_stack_min_pointer(&self, ptr: *const u8);
+    /// Get the lowest address of the process's stack , if it was recorded.
+    fn get_app_stack_min_pointer(&self) -> Option<*const u8>;
+    /// Provide the current address of the bottom of the stack and record the
+    /// address if it is the lowest address that the process's stack has
+    /// reached.
+    fn set_new_app_stack_min_pointer(&self, ptr: *const u8);
+
+    /// Record the most recent system call the process called.
+    fn set_last_syscall(&self, syscall: Syscall);
+    /// Get the most recent system call the process called, if it was recorded.
+    fn get_last_syscall(&self) -> Option<Syscall>;
+    /// Clear any record of the most recent system call the process called.
+    fn reset_last_syscall(&self);
+
+    /// Increase the recorded count of the number of system calls the process
+    /// has called.
+    fn increment_syscall_count(&self);
+    /// Get the recorded count of the number of system calls the process has
+    /// called.
+    ///
+    /// This should return 0 if
+    /// [`ProcessStandardDebug::increment_syscall_count()`] is never called.
+    fn get_syscall_count(&self) -> usize;
+    /// Reset the recorded count of the number of system calls called by the app
+    /// to 0.
+    fn reset_syscall_count(&self);
+
+    /// Increase the recorded count of the number of upcalls that have been
+    /// dropped for the process.
+    fn increment_dropped_upcall_count(&self);
+    /// Get the recorded count of the number of upcalls that have been dropped
+    /// for the process.
+    ///
+    /// This should return 0 if
+    /// [`ProcessStandardDebug::increment_dropped_upcall_count()`] is never
+    /// called.
+    fn get_dropped_upcall_count(&self) -> usize;
+    /// Reset the recorded count of the number of upcalls that have been dropped
+    /// for the process to 0.
+    fn reset_dropped_upcall_count(&self);
+
+    /// Increase the recorded count of the number of times the process has
+    /// exceeded its timeslice.
+    fn increment_timeslice_expiration_count(&self);
+    /// Get the recorded count of the number times the process has exceeded its
+    /// timeslice.
+    ///
+    /// This should return 0 if
+    /// [`ProcessStandardDebug::increment_timeslice_expiration_count()`] is
+    /// never called.
+    fn get_timeslice_expiration_count(&self) -> usize;
+    /// Reset the recorded count of the number of the process has exceeded its
+    /// timeslice to 0.
+    fn reset_timeslice_expiration_count(&self);
+}
+
+/// A debugging implementation for [`ProcessStandard`] that records the full
+/// debugging state.
+pub struct ProcessStandardDebugFull {
+    /// Inner field for the debug state that is in a [`MapCell`] to provide
+    /// mutable access.
+    debug: MapCell<ProcessStandardDebugFullInner>,
+}
+
+/// Struct for debugging [`ProcessStandard`] processes that records the full set
+/// of debugging information.
+///
+/// These pointers and counters are not strictly required for kernel operation,
+/// but provide helpful information when an app crashes.
+#[derive(Default)]
+struct ProcessStandardDebugFullInner {
+    /// If this process was compiled for fixed addresses, save the address
+    /// it must be at in flash. This is useful for debugging and saves having
+    /// to re-parse the entire TBF header.
+    fixed_address_flash: Option<u32>,
+
+    /// If this process was compiled for fixed addresses, save the address
+    /// it must be at in RAM. This is useful for debugging and saves having
+    /// to re-parse the entire TBF header.
+    fixed_address_ram: Option<u32>,
+
+    /// Where the process has started its heap in RAM.
+    app_heap_start_pointer: Option<*const u8>,
+
+    /// Where the start of the stack is for the process. If the kernel does the
+    /// PIC setup for this app then we know this, otherwise we need the app to
+    /// tell us where it put its stack.
+    app_stack_start_pointer: Option<*const u8>,
+
+    /// How low have we ever seen the stack pointer.
+    app_stack_min_pointer: Option<*const u8>,
+
+    /// How many syscalls have occurred since the process started.
+    syscall_count: usize,
+
+    /// What was the most recent syscall.
+    last_syscall: Option<Syscall>,
+
+    /// How many upcalls were dropped because the queue was insufficiently
+    /// long.
+    dropped_upcall_count: usize,
+
+    /// How many times this process has been paused because it exceeded its
+    /// timeslice.
+    timeslice_expiration_count: usize,
+}
+
+impl ProcessStandardDebug for ProcessStandardDebugFull {
+    fn set_fixed_address_flash(&self, address: u32) {
+        self.debug.map(|d| d.fixed_address_flash = Some(address));
+    }
+    fn get_fixed_address_flash(&self) -> Option<u32> {
+        self.debug.map_or(None, |d| d.fixed_address_flash)
+    }
+    fn set_fixed_address_ram(&self, address: u32) {
+        self.debug.map(|d| d.fixed_address_ram = Some(address));
+    }
+    fn get_fixed_address_ram(&self) -> Option<u32> {
+        self.debug.map_or(None, |d| d.fixed_address_ram)
+    }
+    fn set_app_heap_start_pointer(&self, ptr: *const u8) {
+        self.debug.map(|d| d.app_heap_start_pointer = Some(ptr));
+    }
+    fn get_app_heap_start_pointer(&self) -> Option<*const u8> {
+        self.debug.map_or(None, |d| d.app_heap_start_pointer)
+    }
+    fn set_app_stack_start_pointer(&self, ptr: *const u8) {
+        self.debug.map(|d| d.app_stack_start_pointer = Some(ptr));
+    }
+    fn get_app_stack_start_pointer(&self) -> Option<*const u8> {
+        self.debug.map_or(None, |d| d.app_stack_start_pointer)
+    }
+    fn set_app_stack_min_pointer(&self, ptr: *const u8) {
+        self.debug.map(|d| d.app_stack_min_pointer = Some(ptr));
+    }
+    fn get_app_stack_min_pointer(&self) -> Option<*const u8> {
+        self.debug.map_or(None, |d| d.app_stack_min_pointer)
+    }
+    fn set_new_app_stack_min_pointer(&self, ptr: *const u8) {
+        self.debug.map(|d| {
+            match d.app_stack_min_pointer {
+                None => d.app_stack_min_pointer = Some(ptr),
+                Some(asmp) => {
+                    // Update max stack depth if needed.
+                    if ptr < asmp {
+                        d.app_stack_min_pointer = Some(ptr);
+                    }
+                }
+            }
+        });
+    }
+
+    fn set_last_syscall(&self, syscall: Syscall) {
+        self.debug.map(|d| d.last_syscall = Some(syscall));
+    }
+    fn get_last_syscall(&self) -> Option<Syscall> {
+        self.debug.map_or(None, |d| d.last_syscall)
+    }
+    fn reset_last_syscall(&self) {
+        self.debug.map(|d| d.last_syscall = None);
+    }
+
+    fn increment_syscall_count(&self) {
+        self.debug.map(|d| d.syscall_count += 1);
+    }
+    fn get_syscall_count(&self) -> usize {
+        self.debug.map_or(0, |d| d.syscall_count)
+    }
+    fn reset_syscall_count(&self) {
+        self.debug.map(|d| d.syscall_count = 0);
+    }
+
+    fn increment_dropped_upcall_count(&self) {
+        self.debug.map(|d| d.dropped_upcall_count += 1);
+    }
+    fn get_dropped_upcall_count(&self) -> usize {
+        self.debug.map_or(0, |d| d.dropped_upcall_count)
+    }
+    fn reset_dropped_upcall_count(&self) {
+        self.debug.map(|d| d.dropped_upcall_count = 0);
+    }
+
+    fn increment_timeslice_expiration_count(&self) {
+        self.debug.map(|d| d.timeslice_expiration_count += 1);
+    }
+    fn get_timeslice_expiration_count(&self) -> usize {
+        self.debug.map_or(0, |d| d.timeslice_expiration_count)
+    }
+    fn reset_timeslice_expiration_count(&self) {
+        self.debug.map(|d| d.timeslice_expiration_count = 0);
+    }
+}
+
+impl Default for ProcessStandardDebugFull {
+    fn default() -> Self {
+        Self {
+            debug: MapCell::new(ProcessStandardDebugFullInner::default()),
+        }
+    }
+}
+
+impl ProcessStandardDebug for () {
+    fn set_fixed_address_flash(&self, _address: u32) {}
+    fn get_fixed_address_flash(&self) -> Option<u32> {
+        None
+    }
+    fn set_fixed_address_ram(&self, _address: u32) {}
+    fn get_fixed_address_ram(&self) -> Option<u32> {
+        None
+    }
+    fn set_app_heap_start_pointer(&self, _ptr: *const u8) {}
+    fn get_app_heap_start_pointer(&self) -> Option<*const u8> {
+        None
+    }
+    fn set_app_stack_start_pointer(&self, _ptr: *const u8) {}
+    fn get_app_stack_start_pointer(&self) -> Option<*const u8> {
+        None
+    }
+    fn set_app_stack_min_pointer(&self, _ptr: *const u8) {}
+    fn get_app_stack_min_pointer(&self) -> Option<*const u8> {
+        None
+    }
+    fn set_new_app_stack_min_pointer(&self, _ptr: *const u8) {}
+
+    fn set_last_syscall(&self, _syscall: Syscall) {}
+    fn get_last_syscall(&self) -> Option<Syscall> {
+        None
+    }
+    fn reset_last_syscall(&self) {}
+
+    fn increment_syscall_count(&self) {}
+    fn get_syscall_count(&self) -> usize {
+        0
+    }
+    fn reset_syscall_count(&self) {}
+    fn increment_dropped_upcall_count(&self) {}
+    fn get_dropped_upcall_count(&self) -> usize {
+        0
+    }
+    fn reset_dropped_upcall_count(&self) {}
+    fn increment_timeslice_expiration_count(&self) {}
+    fn get_timeslice_expiration_count(&self) -> usize {
+        0
+    }
+    fn reset_timeslice_expiration_count(&self) {}
+}
+
+/// Entry that is stored in the grant pointer table at the top of process
+/// memory.
+///
+/// One copy of this entry struct is stored per grant region defined in the
+/// kernel. This type allows the core kernel to lookup a grant based on the
+/// driver_num associated with the grant, and also holds the pointer to the
+/// memory allocated for the particular grant.
+#[repr(C)]
+struct GrantPointerEntry {
+    /// The syscall driver number associated with the allocated grant.
+    ///
+    /// This defaults to 0 if the grant has not been allocated. Note, however,
+    /// that 0 is a valid driver_num, and therefore cannot be used to check if a
+    /// grant is allocated or not.
+    driver_num: usize,
+
+    /// The start of the memory location where the grant has been allocated, or
+    /// null if the grant has not been allocated.
+    grant_ptr: *mut u8,
+}
+
+/// A type for userspace processes in Tock.
+///
+/// As its name implies, this is the standard implementation for Tock processes
+/// that exposes the full support for processes running on embedded hardware.
+///
+/// [`ProcessStandard`] is templated on two parameters:
+///
+/// - `C`: [`Chip`]: The implementation must know the [`Chip`] the kernel is
+///   running on to properly store architecture-specific and MPU state for the
+///   process.
+/// - `D`: [`ProcessStandardDebug`]: This configures the debugging mechanism the
+///   process uses for storing optional debugging data. Kernels that do not wish
+///   to store per-process debugging state can use the `()` type for this
+///   parameter.
+pub struct ProcessStandard<'a, C: 'static + Chip, D: 'static + ProcessStandardDebug + Default> {
+    /// Identifier of this process and the index of the process in the process
+    /// table.
+    process_id: Cell<ProcessId>,
+
+    /// An application ShortId, generated from process loading and
+    /// checking, which denotes the security identity of this process.
+    app_id: ShortId,
+
+    /// Pointer to the main Kernel struct.
+    kernel: &'static Kernel,
+
+    /// Pointer to the struct that defines the actual chip the kernel is running
+    /// on. This is used because processes have subtle hardware-based
+    /// differences. Specifically, the actual syscall interface and how
+    /// processes are switched to is architecture-specific, and how memory must
+    /// be allocated for memory protection units is also hardware-specific.
+    chip: &'static C,
+
+    /// Application memory layout:
+    ///
+    /// ```text
+    ///     ╒════════ ← memory_start + memory_len
+    ///  ╔═ │ Grant Pointers
+    ///  ║  │ ──────
+    ///  ║  │ Upcall Queue
+    ///  ║  │ ──────
+    ///     │ Process Control Block
+    ///  D  │ ──────
+    ///  Y  │ Grant Regions
+    ///  N  │
+    ///  A  │   ↓
+    ///  M  │ ──────  ← kernel_memory_break
+    ///  I  │
+    ///  C  │ ──────  ← app_break               ═╗
+    ///     │                                    ║
+    ///  ║  │   ↑                                  A
+    ///  ║  │  Heap                              P C
+    ///  ╠═ │ ──────  ← app_heap_start           R C
+    ///     │  Data                              O E
+    ///  F  │ ──────  ← data_start_pointer       C S
+    ///  I  │ Stack                              E S
+    ///  X  │   ↓                                S I
+    ///  E  │                                    S B
+    ///  D  │ ──────  ← current_stack_pointer      L
+    ///     │                                    ║ E
+    ///  ╚═ ╘════════ ← memory_start            ═╝
+    /// ```
+    ///
+    /// The start of process memory. We store this as a pointer and length and
+    /// not a slice due to Rust aliasing rules. If we were to store a slice,
+    /// then any time another slice to the same memory or an ProcessBuffer is
+    /// used in the kernel would be undefined behavior.
+    memory_start: *const u8,
+    /// Number of bytes of memory allocated to this process.
+    memory_len: usize,
+
+    /// Reference to the slice of `GrantPointerEntry`s stored in the process's
+    /// memory reserved for the kernel. These driver numbers are zero and
+    /// pointers are null if the grant region has not been allocated. When the
+    /// grant region is allocated these pointers are updated to point to the
+    /// allocated memory and the driver number is set to match the driver that
+    /// owns the grant. No other reference to these pointers exists in the Tock
+    /// kernel.
+    grant_pointers: MapCell<&'static mut [GrantPointerEntry]>,
+
+    /// Pointer to the end of the allocated (and MPU protected) grant region.
+    kernel_memory_break: Cell<*const u8>,
+
+    /// Pointer to the end of process RAM that has been sbrk'd to the process.
+    app_break: Cell<*const u8>,
+
+    /// Pointer to high water mark for process buffers shared through `allow`
+    allow_high_water_mark: Cell<*const u8>,
+
+    /// Process flash segment. This is the region of nonvolatile flash that
+    /// the process occupies.
+    flash: &'static [u8],
+
+    /// The footers of the process binary (may be zero-sized), which are metadata
+    /// about the process not covered by integrity. Used, among other things, to
+    /// store signatures.
+    footers: &'static [u8],
+
+    /// Collection of pointers to the TBF header in flash.
+    header: tock_tbf::types::TbfHeader<'static>,
+
+    /// Credential that was approved for this process, or `None` if the
+    /// credential was permitted to run without an accepted credential.
+    credential: Option<AcceptedCredential>,
+
+    /// State saved on behalf of the process each time the app switches to the
+    /// kernel.
+    stored_state:
+        MapCell<<<C as Chip>::UserspaceKernelBoundary as UserspaceKernelBoundary>::StoredState>,
+
+    /// The current state of the app. The scheduler uses this to determine
+    /// whether it can schedule this app to execute.
+    ///
+    /// The `state` is used both for bookkeeping for the scheduler as well as
+    /// for enabling control by other parts of the system. The scheduler keeps
+    /// track of if a process is ready to run or not by switching between the
+    /// `Running` and `Yielded` states. The system can control the process by
+    /// switching it to a "stopped" state to prevent the scheduler from
+    /// scheduling it.
+    state: Cell<State>,
+
+    /// How to respond if this process faults.
+    fault_policy: &'a dyn ProcessFaultPolicy,
+
+    /// Storage permissions for this process.
+    ///
+    /// This is stored in a `Cell` because we need to create the
+    /// [`ProcessStandard`] first to then later determine the storage
+    /// permissions.
+    storage_permissions: Cell<StoragePermissions>,
+
+    /// Configuration data for the MPU
+    mpu_config: MapCell<<<C as Chip>::MPU as MPU>::MpuConfig>,
+
+    /// MPU regions are saved as a pointer-size pair.
+    mpu_regions: [Cell<Option<mpu::Region>>; 6],
+
+    /// Essentially a list of upcalls that want to call functions in the
+    /// process.
+    tasks: MapCell<RingBuffer<'a, Task>>,
+
+    /// Count of how many times this process has entered the fault condition and
+    /// been restarted. This is used by some `ProcessRestartPolicy`s to
+    /// determine if the process should be restarted or not.
+    restart_count: Cell<usize>,
+
+    /// The completion code set by the process when it last exited, restarted,
+    /// or was terminated. If the process is has never terminated, then the
+    /// `OptionalCell` will be empty (i.e. `None`). If the process has exited,
+    /// restarted, or terminated, the `OptionalCell` will contain an optional 32
+    /// bit value. The option will be `None` if the process crashed or was
+    /// stopped by the kernel and there is no provided completion code. If the
+    /// process called the exit syscall then the provided completion code will
+    /// be stored as `Some(completion code)`.
+    completion_code: OptionalCell<Option<u32>>,
+
+    /// Flag that stores whether this process has a task that is ready when
+    /// the process is in the [`State::YieldedFor`] state.
+    is_yield_wait_for_ready: Cell<bool>,
+
+    /// Values kept so that we can print useful debug messages when apps fault.
+    debug: D,
+}
+
+impl<C: Chip, D: 'static + ProcessStandardDebug> Process for ProcessStandard<'_, C, D> {
+    fn processid(&self) -> ProcessId {
+        self.process_id.get()
+    }
+
+    fn short_app_id(&self) -> ShortId {
+        self.app_id
+    }
+
+    fn binary_version(&self) -> Option<BinaryVersion> {
+        let version = self.header.get_binary_version();
+        match NonZeroU32::new(version) {
+            Some(version_nonzero) => Some(BinaryVersion::new(version_nonzero)),
+            None => None,
+        }
+    }
+
+    fn get_credential(&self) -> Option<AcceptedCredential> {
+        self.credential
+    }
+
+    fn enqueue_task(&self, task: Task) -> Result<(), ErrorCode> {
+        // If this app is in a `Fault` state then we shouldn't schedule
+        // any work for it.
+        if !self.is_running() {
+            return Err(ErrorCode::NODEVICE);
+        }
+
+        let ret = self.tasks.map_or(Err(ErrorCode::FAIL), |tasks| {
+            match tasks.enqueue(task) {
+                true => {
+                    let opt_this_upcall_id = match task {
+                        Task::FunctionCall(FunctionCall {
+                            source: FunctionCallSource::Driver(upcall_id),
+                            ..
+                        }) => Some(upcall_id),
+                        Task::ReturnValue(ReturnArguments { upcall_id, .. }) => Some(upcall_id),
+                        _ => None,
+                    };
+
+                    // If the process is yielded-for this task, set the ready flag.
+                    //
+                    // In case the process is yielding for another upcall, don't
+                    // clear the flag; this would re-introduce the race
+                    // condition of #5195.
+                    if let State::YieldedFor(yielded_upcall_id) = self.state.get()
+                        && let Some(this_upcall_id) = opt_this_upcall_id
+                        && yielded_upcall_id == this_upcall_id
+                    {
+                        self.is_yield_wait_for_ready.set(true);
+                    }
+
+                    // The task has been successfully enqueued.
+                    Ok(())
+                }
+                false => {
+                    // The task could not be enqueued as there is
+                    // insufficient space in the ring buffer.
+                    Err(ErrorCode::NOMEM)
+                }
+            }
+        });
+
+        if ret.is_err() {
+            // On any error we were unable to enqueue the task. Record the
+            // error, but importantly do _not_ increment kernel work.
+            self.debug.increment_dropped_upcall_count();
+        }
+
+        ret
+    }
+
+    fn ready(&self) -> bool {
+        match self.state.get() {
+            State::Running => true,
+            State::YieldedFor(_) => self.is_yield_wait_for_ready.get(),
+            State::Yielded => self.tasks.map_or(false, |ring_buf| ring_buf.has_elements()),
+            _ => false,
+        }
+    }
+
+    fn remove_pending_upcalls(&self, upcall_id: UpcallId) -> usize {
+        self.tasks.map_or(0, |tasks| {
+            let count_before = tasks.len();
+            tasks.retain(|task| match task {
+                // Remove only tasks that are function calls with an id equal
+                // to `upcall_id`.
+                Task::FunctionCall(function_call) => match function_call.source {
+                    FunctionCallSource::Kernel => true,
+                    FunctionCallSource::Driver(id) => id != upcall_id,
+                },
+                _ => true,
+            });
+            let count_after = tasks.len();
+            if config::CONFIG.trace_syscalls {
+                debug!(
+                    "[{:?}] remove_pending_upcalls[{:#x}:{}] = {} upcall(s) removed",
+                    self.processid(),
+                    upcall_id.driver_num,
+                    upcall_id.subscribe_num,
+                    count_before - count_after,
+                );
+            }
+            count_before - count_after
+        })
+    }
+
+    fn is_running(&self) -> bool {
+        match self.state.get() {
+            State::Running | State::Yielded | State::YieldedFor(_) | State::Stopped(_) => true,
+            _ => false,
+        }
+    }
+
+    fn get_state(&self) -> State {
+        self.state.get()
+    }
+
+    fn set_yielded_state(&self) {
+        if self.state.get() == State::Running {
+            self.state.set(State::Yielded);
+        }
+    }
+
+    fn set_yielded_for_state(&self, upcall_id: UpcallId) {
+        if self.state.get() == State::Running
+            || self.state.get() == State::Stopped(StoppedState::YieldedFor(upcall_id))
+        {
+            self.state.set(State::YieldedFor(upcall_id));
+
+            // Verify if the process has a task that this yield waits for
+            self.is_yield_wait_for_ready
+                .set(self.tasks.map_or(false, |tasks| {
+                    tasks
+                        .find_first_matching(|task| match task {
+                            Task::ReturnValue(ReturnArguments { upcall_id: id, .. }) => {
+                                upcall_id == *id
+                            }
+                            Task::FunctionCall(FunctionCall {
+                                source: FunctionCallSource::Driver(id),
+                                ..
+                            }) => upcall_id == *id,
+                            _ => false,
+                        })
+                        .is_some()
+                }));
+        }
+    }
+
+    fn stop(&self) {
+        match self.state.get() {
+            State::Running => self.state.set(State::Stopped(StoppedState::Running)),
+            State::Yielded => self.state.set(State::Stopped(StoppedState::Yielded)),
+            State::YieldedFor(upcall_id) => self
+                .state
+                .set(State::Stopped(StoppedState::YieldedFor(upcall_id))),
+            State::Stopped(_stopped_state) => {
+                // Already stopped, nothing to do.
+            }
+            State::Faulted | State::Terminated => {
+                // Stop has no meaning on a inactive process.
+            }
+        }
+    }
+
+    fn resume(&self) {
+        if let State::Stopped(stopped_state) = self.state.get() {
+            match stopped_state {
+                StoppedState::Running => self.state.set(State::Running),
+                StoppedState::Yielded => self.state.set(State::Yielded),
+                StoppedState::YieldedFor(upcall_id) => self.set_yielded_for_state(upcall_id),
+            }
+        }
+    }
+
+    fn set_fault_state(&self) {
+        // Use the per-process fault policy to determine what action the kernel
+        // should take since the process faulted.
+        let action = self.fault_policy.action(self);
+        match action {
+            FaultAction::Panic => {
+                // process faulted. Panic and print status
+                self.state.set(State::Faulted);
+                panic!("Process {} had a fault", self.get_process_name());
+            }
+            FaultAction::Restart => {
+                self.try_restart(None);
+            }
+            FaultAction::Stop => {
+                // This looks a lot like restart, except we just leave the app
+                // how it faulted and mark it as `Faulted`. By clearing
+                // all of the app's todo work it will not be scheduled, and
+                // clearing all of the grant regions will cause capsules to drop
+                // this app as well.
+                self.terminate(None);
+                self.state.set(State::Faulted);
+            }
+        }
+    }
+
+    fn start(&self, _cap: &dyn crate::capabilities::ProcessStartCapability) {
+        // `start()` can only be called on a terminated process.
+        if self.get_state() != State::Terminated {
+            return;
+        }
+
+        // Reset to start the process.
+        if let Ok(()) = self.reset() {
+            self.state.set(State::Yielded);
+        }
+    }
+
+    fn try_restart(&self, completion_code: Option<u32>) {
+        // `try_restart()` cannot be called if the process is terminated. Only
+        // `start()` can start a terminated process.
+        if self.get_state() == State::Terminated {
+            return;
+        }
+
+        // Terminate the process, freeing its state and removing any
+        // pending tasks from the scheduler's queue.
+        self.terminate(completion_code);
+
+        // If there is a kernel policy that controls restarts, it should be
+        // implemented here. For now, always restart.
+        if let Ok(()) = self.reset() {
+            self.state.set(State::Yielded);
+        }
+
+        // Decide what to do with res later. E.g., if we can't restart
+        // want to reclaim the process resources.
+    }
+
+    fn terminate(&self, completion_code: Option<u32>) {
+        // A process can be terminated if it is running or in the `Faulted`
+        // state. Otherwise, you cannot terminate it and this method return
+        // early.
+        //
+        // The kernel can terminate in the `Faulted` state to return the process
+        // to a state in which it can run again (e.g., reset it).
+        if !self.is_running() && self.get_state() != State::Faulted {
+            return;
+        }
+
+        // And remove those tasks
+        self.tasks.map(|tasks| {
+            tasks.empty();
+        });
+
+        // Clear any grant regions this app has setup with any capsules by
+        // setting all `grant_ptr`s to NULL.
+        self.grant_pointers.map(|grant_pointers| {
+            for grant_entry in grant_pointers.iter_mut() {
+                grant_entry.driver_num = 0;
+                grant_entry.grant_ptr = ptr::null_mut();
+            }
+        });
+
+        // Save the completion code.
+        self.completion_code.set(completion_code);
+
+        // Mark the app as stopped so the scheduler won't try to run it.
+        self.state.set(State::Terminated);
+    }
+
+    fn get_restart_count(&self) -> usize {
+        self.restart_count.get()
+    }
+
+    fn has_tasks(&self) -> bool {
+        self.tasks.map_or(false, |tasks| tasks.has_elements())
+    }
+
+    fn dequeue_task(&self) -> Option<Task> {
+        self.tasks.map_or(None, |tasks| tasks.dequeue())
+    }
+
+    fn remove_upcall(&self, upcall_id: UpcallId) -> Option<Task> {
+        self.tasks.map_or(None, |tasks| {
+            tasks.remove_first_matching(|task| match task {
+                Task::FunctionCall(fc) => match fc.source {
+                    FunctionCallSource::Driver(upid) => upid == upcall_id,
+                    _ => false,
+                },
+                Task::ReturnValue(rv) => rv.upcall_id == upcall_id,
+                Task::IPC(_) => false,
+            })
+        })
+    }
+
+    fn pending_tasks(&self) -> usize {
+        self.tasks.map_or(0, |tasks| tasks.len())
+    }
+
+    fn get_command_permissions(&self, driver_num: usize, offset: usize) -> CommandPermissions {
+        self.header.get_command_permissions(driver_num, offset)
+    }
+
+    fn get_storage_permissions(&self) -> StoragePermissions {
+        self.storage_permissions.get()
+    }
+
+    fn number_writeable_flash_regions(&self) -> usize {
+        self.header.number_writeable_flash_regions()
+    }
+
+    fn get_writeable_flash_region(&self, region_index: usize) -> (usize, usize) {
+        self.header.get_writeable_flash_region(region_index)
+    }
+
+    fn update_stack_start_pointer(&self, stack_pointer: *const u8) {
+        if stack_pointer >= self.mem_start() && stack_pointer < self.mem_end() {
+            self.debug.set_app_stack_start_pointer(stack_pointer);
+            // We also reset the minimum stack pointer because whatever
+            // value we had could be entirely wrong by now.
+            self.debug.set_app_stack_min_pointer(stack_pointer);
+        }
+    }
+
+    fn update_heap_start_pointer(&self, heap_pointer: *const u8) {
+        if heap_pointer >= self.mem_start() && heap_pointer < self.mem_end() {
+            self.debug.set_app_heap_start_pointer(heap_pointer);
+        }
+    }
+
+    fn setup_mpu(&self) {
+        self.mpu_config.map(|config| {
+            // SAFETY: `configure_mpu` is unsafe, as invoking it with an incorrect
+            // configuration can allow an untrusted application to access
+            // kernel-private memory.
+            //
+            // This call is safe given we trust that the implementation of
+            // `ProcessStandard` correctly provisions a set of MPU regions that
+            // does not grant access to any kernel-private memory, and
+            // `ProcessStandard` does not provide safe, publicly accessible
+            // APIs to add other arbitrary MPU regions to this configuration.
+            unsafe {
+                self.chip.mpu().configure_mpu(config);
+            }
+        });
+    }
+
+    fn add_mpu_region(
+        &self,
+        unallocated_memory_start: *const u8,
+        unallocated_memory_size: usize,
+        min_region_size: usize,
+    ) -> Option<mpu::Region> {
+        self.mpu_config.and_then(|config| {
+            let new_region = self.chip.mpu().allocate_region(
+                unallocated_memory_start,
+                unallocated_memory_size,
+                min_region_size,
+                mpu::Permissions::ReadWriteOnly,
+                config,
+            )?;
+
+            for region in self.mpu_regions.iter() {
+                if region.get().is_none() {
+                    region.set(Some(new_region));
+                    return Some(new_region);
+                }
+            }
+
+            // Not enough room in Process struct to store the MPU region.
+            None
+        })
+    }
+
+    fn remove_mpu_region(&self, region: mpu::Region) -> Result<(), ErrorCode> {
+        self.mpu_config.map_or(Err(ErrorCode::INVAL), |config| {
+            // Find the existing mpu region that we are removing; it needs to match exactly.
+            if let Some(internal_region) = self.mpu_regions.iter().find(|r| r.get() == Some(region))
+            {
+                self.chip
+                    .mpu()
+                    .remove_memory_region(region, config)
+                    .or(Err(ErrorCode::FAIL))?;
+
+                // Remove this region from the tracking cache of mpu_regions
+                internal_region.set(None);
+                Ok(())
+            } else {
+                Err(ErrorCode::INVAL)
+            }
+        })
+    }
+
+    fn sbrk(&self, increment: isize) -> Result<CapabilityPtr, Error> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return Err(Error::InactiveApp);
+        }
+
+        let new_break = self.app_break.get().wrapping_offset(increment);
+        self.brk(new_break)
+    }
+
+    fn brk(&self, new_break: *const u8) -> Result<CapabilityPtr, Error> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return Err(Error::InactiveApp);
+        }
+
+        self.mpu_config.map_or(Err(Error::KernelError), |config| {
+            if new_break < self.allow_high_water_mark.get() || new_break >= self.mem_end() {
+                Err(Error::AddressOutOfBounds)
+            } else if new_break > self.kernel_memory_break.get() {
+                Err(Error::OutOfMemory)
+            } else if let Err(()) = self.chip.mpu().update_app_memory_region(
+                new_break,
+                self.kernel_memory_break.get(),
+                mpu::Permissions::ReadWriteOnly,
+                config,
+            ) {
+                Err(Error::OutOfMemory)
+            } else {
+                let old_break: *const u8 = self.app_break.get();
+                self.app_break.set(new_break);
+
+                // SAFETY: `configure_mpu` is unsafe, as invoking it with an incorrect
+                // configuration can allow an untrusted application to access
+                // kernel-private memory.
+                //
+                // This call is safe given we trust that the implementation of
+                // `ProcessStandard` correctly provisions a set of MPU regions
+                // that does not grant access to any kernel-private memory, and
+                // `ProcessStandard` does not provide safe, publicly
+                // accessible APIs to add other arbitrary MPU regions to this
+                // configuration.
+                unsafe {
+                    self.chip.mpu().configure_mpu(config);
+                }
+
+                if new_break > old_break {
+                    // We need to initialize (zero) the newly accessible memory
+                    // region at `[old_break; new_break)`. This serves two
+                    // purposes:
+                    //
+                    // 1. It prevents a process from accessing any information
+                    //    still contained in this memory from prior kernel
+                    //    instances or processes.
+                    //
+                    // 2. It satisfies Rust's requirements that all
+                    //    dereferencable memory be properly initialized. This is
+                    //    important, as we'll be creating references into this
+                    //    process-accessible memory region through the process
+                    //    buffer infrastructure.
+                    let old_break_mut_ptr: *mut u8 = old_break.cast_mut();
+                    // SAFETY: We know this will write to only process-accessible memory
+                    // that has never been used to create any kernel data structures
+                    // because of the checks at the beginning of this function. We also
+                    // know this is valid memory to write to because we checked the
+                    // new_break is within process memory. Because we are using `u8`, we
+                    // know `old_break_mut_ptr` is aligned. Since the process will have
+                    // access to this memory we know the kernel will not try to use it
+                    // for any data structures, avoiding any potential future memory
+                    // initialization error.
+                    unsafe {
+                        core::ptr::write_bytes(
+                            old_break_mut_ptr,
+                            // Set the newly app-accessible memory to `0`:
+                            0_u8,
+                            new_break.addr() - old_break.addr(),
+                        );
+                    }
+                }
+
+                let base = self.mem_start() as usize;
+                let old_break_unit_ptr: *const () = old_break.cast();
+                // SAFETY: It must be safe for this process to access the
+                // bounds+permission expressed here while assuming no other
+                // protection mechanism is active.
+                //  - A process should have Read+Write access to its memory.
+                //  - The function has established [base, new_break) as the
+                //    (new) valid bounds for process memory.
+                //  - We grant only Read+Write permissions.
+                //  - We only pass this pointer to this process.
+                let break_result = unsafe {
+                    CapabilityPtr::new_with_authority(
+                        old_break_unit_ptr,
+                        base,
+                        (new_break as usize) - base,
+                        CapabilityPtrPermissions::ReadWrite,
+                    )
+                };
+
+                Ok(break_result)
+            }
+        })
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn build_readwrite_process_buffer(
+        &self,
+        buf_start_addr: *mut u8,
+        size: usize,
+    ) -> Result<ReadWriteProcessBuffer, ErrorCode> {
+        if !self.is_running() {
+            // Do not operate on an inactive process
+            return Err(ErrorCode::FAIL);
+        }
+
+        // A process is allowed to pass any pointer if the buffer length is 0,
+        // as to revoke kernel access to a memory region without granting access
+        // to another one
+        if size == 0 {
+            // Clippy complains that we're dereferencing a pointer in a public
+            // and safe function here. While we are not dereferencing the
+            // pointer here, we pass it along to an unsafe function, which is as
+            // dangerous (as it is likely to be dereferenced down the line).
+            //
+            // Relevant discussion:
+            // https://github.com/rust-lang/rust-clippy/issues/3045
+            //
+            // It should be fine to ignore the lint here, as a buffer of length
+            // 0 will never allow dereferencing any memory in a safe manner.
+            //
+            // SAFETY: We specify a zero-length buffer, so the implementation of
+            // `ReadWriteProcessBuffer` will handle any safety issues.
+            // Therefore, we can encapsulate the unsafe.
+            Ok(unsafe { ReadWriteProcessBuffer::new(buf_start_addr, 0, self.processid()) })
+        } else if self.in_app_owned_memory(buf_start_addr, size) {
+            // TODO: Check for buffer aliasing here
+
+            // Valid buffer, we need to adjust the app's watermark
+            // note: `in_app_owned_memory` ensures this offset does not wrap
+            let buf_end_addr = buf_start_addr.wrapping_add(size);
+            let new_water_mark = cmp::max(self.allow_high_water_mark.get(), buf_end_addr);
+            self.allow_high_water_mark.set(new_water_mark);
+
+            // Clippy complains that we're dereferencing a pointer in a public
+            // and safe function here. While we are not dereferencing the
+            // pointer here, we pass it along to an unsafe function, which is as
+            // dangerous (as it is likely to be dereferenced down the line).
+            //
+            // Relevant discussion:
+            // https://github.com/rust-lang/rust-clippy/issues/3045
+            //
+            // It should be fine to ignore the lint here, as long as we make
+            // sure that we're pointing towards userspace memory (verified using
+            // `in_app_owned_memory`) and respect alignment and other
+            // constraints of the Rust references created by
+            // `ReadWriteProcessBuffer`.
+            //
+            // SAFETY: We encapsulate the unsafe here on the condition in the TODO
+            // above, as we must ensure that this `ReadWriteProcessBuffer` will
+            // be the only reference to this memory.
+            Ok(unsafe { ReadWriteProcessBuffer::new(buf_start_addr, size, self.processid()) })
+        } else {
+            Err(ErrorCode::INVAL)
+        }
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn build_readonly_process_buffer(
+        &self,
+        buf_start_addr: *const u8,
+        size: usize,
+    ) -> Result<ReadOnlyProcessBuffer, ErrorCode> {
+        if !self.is_running() {
+            // Do not operate on an inactive process
+            return Err(ErrorCode::FAIL);
+        }
+
+        // A process is allowed to pass any pointer if the buffer length is 0,
+        // as to revoke kernel access to a memory region without granting access
+        // to another one
+        if size == 0 {
+            // Clippy complains that we're dereferencing a pointer in a public
+            // and safe function here. While we are not dereferencing the
+            // pointer here, we pass it along to an unsafe function, which is as
+            // dangerous (as it is likely to be dereferenced down the line).
+            //
+            // Relevant discussion:
+            // https://github.com/rust-lang/rust-clippy/issues/3045
+            //
+            // It should be fine to ignore the lint here, as a buffer of length
+            // 0 will never allow dereferencing any memory in a safe manner.
+            //
+            // SAFETY: We specify a zero-length buffer, so the implementation of
+            // `ReadOnlyProcessBuffer` will handle any safety issues. Therefore,
+            // we can encapsulate the unsafe.
+            Ok(unsafe { ReadOnlyProcessBuffer::new(buf_start_addr, 0, self.processid()) })
+        } else if self.in_app_owned_memory(buf_start_addr, size)
+            || self.in_app_flash_memory(buf_start_addr, size)
+        {
+            // TODO: Check for buffer aliasing here
+
+            if self.in_app_owned_memory(buf_start_addr, size) {
+                // Valid buffer, and since this is in read-write memory (i.e.
+                // not flash), we need to adjust the process's watermark. Note:
+                // `in_app_owned_memory()` ensures this offset does not wrap.
+                let buf_end_addr = buf_start_addr.wrapping_add(size);
+                let new_water_mark = cmp::max(self.allow_high_water_mark.get(), buf_end_addr);
+                self.allow_high_water_mark.set(new_water_mark);
+            }
+
+            // Clippy complains that we're dereferencing a pointer in a public
+            // and safe function here. While we are not dereferencing the
+            // pointer here, we pass it along to an unsafe function, which is as
+            // dangerous (as it is likely to be dereferenced down the line).
+            //
+            // Relevant discussion:
+            // https://github.com/rust-lang/rust-clippy/issues/3045
+            //
+            // It should be fine to ignore the lint here, as long as we make
+            // sure that we're pointing towards userspace memory (verified using
+            // `in_app_owned_memory` or `in_app_flash_memory`) and respect
+            // alignment and other constraints of the Rust references created by
+            // `ReadWriteProcessBuffer`.
+            //
+            // SAFETY: We encapsulate the unsafe here on the condition in the TODO
+            // above, as we must ensure that this `ReadOnlyProcessBuffer` will
+            // be the only reference to this memory.
+            Ok(unsafe { ReadOnlyProcessBuffer::new(buf_start_addr, size, self.processid()) })
+        } else {
+            Err(ErrorCode::INVAL)
+        }
+    }
+
+    unsafe fn set_byte(&self, addr: *mut u8, value: u8) -> bool {
+        if self.in_app_owned_memory(addr, 1) {
+            // SAFETY: We verify that this will only write process-accessible memory,
+            // but this can still be undefined behavior if something else holds
+            // a reference to this memory. The caller must ensure nothing else
+            // holds a reference to this memory.
+            unsafe {
+                *addr = value;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn grant_is_allocated(&self, grant_num: usize) -> Option<bool> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return None;
+        }
+
+        // Update the grant pointer to the address of the new allocation.
+        self.grant_pointers.map_or(None, |grant_pointers| {
+            // Implement `grant_pointers[grant_num]` without a chance of a
+            // panic.
+            grant_pointers
+                .get(grant_num)
+                .map(|grant_entry| !grant_entry.grant_ptr.is_null())
+        })
+    }
+
+    fn allocate_grant(
+        &self,
+        grant_num: usize,
+        driver_num: usize,
+        size: usize,
+        align: usize,
+    ) -> Result<(), ()> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return Err(());
+        }
+
+        // Verify the grant_num is valid.
+        if grant_num >= self.kernel.get_grant_count_and_finalize() {
+            return Err(());
+        }
+
+        // Verify that the grant is not already allocated. If the pointer is not
+        // null then the grant is already allocated.
+        if let Some(is_allocated) = self.grant_is_allocated(grant_num) {
+            if is_allocated {
+                return Err(());
+            }
+        }
+
+        // Verify that there is not already a grant allocated with the same
+        // `driver_num`.
+        let exists = self.grant_pointers.map_or(false, |grant_pointers| {
+            // Check our list of grant pointers if the driver number is used.
+            grant_pointers.iter().any(|grant_entry| {
+                // Check if the grant is both allocated (its grant pointer is
+                // non null) and the driver number matches.
+                (!grant_entry.grant_ptr.is_null()) && grant_entry.driver_num == driver_num
+            })
+        });
+        // If we find a match, then the `driver_num` must already be used and
+        // the grant allocation fails.
+        if exists {
+            return Err(());
+        }
+
+        // Use the shared grant allocator function to actually allocate memory.
+        // Returns `None` if the allocation cannot be created.
+        if let Some(grant_ptr) = self.allocate_in_grant_region_internal(size, align) {
+            // Update the grant pointer to the address of the new allocation.
+            self.grant_pointers.map_or(Err(()), |grant_pointers| {
+                // Implement `grant_pointers[grant_num] = grant_ptr` without a
+                // chance of a panic.
+                grant_pointers
+                    .get_mut(grant_num)
+                    .map_or(Err(()), |grant_entry| {
+                        // Actually set the driver num and grant pointer.
+                        grant_entry.driver_num = driver_num;
+                        grant_entry.grant_ptr = grant_ptr.as_ptr();
+
+                        // If all of this worked, return true.
+                        Ok(())
+                    })
+            })
+        } else {
+            // Could not allocate the memory for the grant region.
+            Err(())
+        }
+    }
+
+    fn allocate_custom_grant(
+        &self,
+        size: usize,
+        align: usize,
+    ) -> Result<(ProcessCustomGrantIdentifier, NonNull<u8>), ()> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return Err(());
+        }
+
+        // Use the shared grant allocator function to actually allocate memory.
+        // Returns `None` if the allocation cannot be created.
+        if let Some(ptr) = self.allocate_in_grant_region_internal(size, align) {
+            // Create the identifier that the caller will use to get access to
+            // this custom grant in the future.
+            let identifier = self.create_custom_grant_identifier(ptr);
+
+            Ok((identifier, ptr))
+        } else {
+            // Could not allocate memory for the custom grant.
+            Err(())
+        }
+    }
+
+    fn enter_grant(&self, grant_num: usize) -> Result<NonNull<u8>, Error> {
+        // Do not try to access the grant region of an inactive process.
+        if !self.is_running() {
+            return Err(Error::InactiveApp);
+        }
+
+        // Retrieve the grant pointer from the `grant_pointers` slice. We use
+        // `[slice].get()` so that if the grant number is invalid this will
+        // return `Err` and not panic.
+        self.grant_pointers
+            .map_or(Err(Error::KernelError), |grant_pointers| {
+                // Implement `grant_pointers[grant_num]` without a chance of a
+                // panic.
+                match grant_pointers.get_mut(grant_num) {
+                    Some(grant_entry) => {
+                        // Check if this is entering a valid grant that has been created and
+                        // initialized. If the grant is not valid then the `grant_ptr` will
+                        // be null.
+                        if let Some(grant_ptr_nonnull) = NonNull::new(grant_entry.grant_ptr) {
+                            // Check if the grant pointer is marked that the grant has already
+                            // been entered. If so, return an error.
+                            if (usize::from(grant_ptr_nonnull.addr())) & 0x1 == 0x1 {
+                                // Lowest bit is one, meaning this grant has been entered.
+                                Err(Error::AlreadyInUse)
+                            } else {
+                                // Now, to mark that the grant has been entered, we set the lowest
+                                // bit to one and save this as the grant pointer.
+                                grant_entry.grant_ptr =
+                                    grant_ptr_nonnull.map_addr(|a| a | 0x1).as_ptr();
+
+                                // And we return the grant pointer to the entered grant.
+                                Ok(grant_ptr_nonnull)
+                            }
+                        } else {
+                            // The grant has not been created and is not valid to enter.
+                            Err(Error::OutOfMemory)
+                        }
+                    }
+                    None => Err(Error::AddressOutOfBounds),
+                }
+            })
+    }
+
+    fn enter_custom_grant(
+        &self,
+        identifier: ProcessCustomGrantIdentifier,
+    ) -> Result<*mut u8, Error> {
+        // Do not try to access the grant region of an inactive process.
+        if !self.is_running() {
+            return Err(Error::InactiveApp);
+        }
+
+        // Get the address of the custom grant based on the identifier.
+        let address = self.get_custom_grant_address(identifier);
+
+        // We never deallocate custom grants and only we can change the
+        // `identifier` so we know this is a valid address for the custom grant.
+        // kernel_memory_break seems like the most reasonable pointer to get the
+        // provenance from.
+        Ok(self.kernel_memory_break().with_addr(address).cast_mut())
+    }
+
+    unsafe fn leave_grant(&self, grant_num: usize) {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return;
+        }
+
+        self.grant_pointers.map(|grant_pointers| {
+            // Implement `grant_pointers[grant_num]` without a chance of a
+            // panic.
+            if let Some(grant_entry) = grant_pointers.get_mut(grant_num) {
+                // Get a copy of the actual grant pointer.
+                let grant_ptr = grant_entry.grant_ptr;
+
+                // Now, to mark that the grant has been released, we set the
+                // lowest bit back to zero and save this as the grant
+                // pointer.
+                grant_entry.grant_ptr = grant_ptr.map_addr(|a| a & !0x1);
+            }
+        });
+    }
+
+    fn grant_allocated_count(&self) -> Option<usize> {
+        // Do not modify an inactive process.
+        if !self.is_running() {
+            return None;
+        }
+
+        self.grant_pointers.map(|grant_pointers| {
+            // Filter our list of grant pointers into just the non-null ones,
+            // and count those. A grant is allocated if its grant pointer is
+            // non-null.
+            grant_pointers
+                .iter()
+                .filter(|grant_entry| !grant_entry.grant_ptr.is_null())
+                .count()
+        })
+    }
+
+    fn lookup_grant_from_driver_num(&self, driver_num: usize) -> Result<usize, Error> {
+        self.grant_pointers
+            .map_or(Err(Error::KernelError), |grant_pointers| {
+                // Filter our list of grant pointers into just the non null
+                // ones, and count those. A grant is allocated if its grant
+                // pointer is non-null.
+                match grant_pointers.iter().position(|grant_entry| {
+                    // Only consider allocated grants.
+                    (!grant_entry.grant_ptr.is_null()) && grant_entry.driver_num == driver_num
+                }) {
+                    Some(idx) => Ok(idx),
+                    None => Err(Error::OutOfMemory),
+                }
+            })
+    }
+
+    fn is_valid_upcall_function_pointer(&self, upcall_fn: *const ()) -> bool {
+        let ptr: *const u8 = upcall_fn.cast();
+        let size = mem::size_of::<*const u8>();
+
+        // It is okay if this function is in memory or flash.
+        self.in_app_flash_memory(ptr, size) || self.in_app_owned_memory(ptr, size)
+    }
+
+    fn get_process_name(&self) -> &'static str {
+        self.header.get_package_name().unwrap_or("")
+    }
+
+    fn get_completion_code(&self) -> Option<Option<u32>> {
+        self.completion_code.get()
+    }
+
+    fn set_syscall_return_value(&self, return_value: SyscallReturn) {
+        match self.stored_state.map(|stored_state| {
+            // Actually set the return value for a particular process.
+            //
+            // SAFETY: The UKB implementation uses the bounds of
+            // process-accessible memory to verify that any memory changes are
+            // valid. Here, the unsafe promise we are making is that the bounds
+            // passed to the UKB are correct. Because we use the start of the
+            // process's memory, and the current `app_break`, we know that the
+            // memory in that range is accessible to the process.
+            unsafe {
+                self.chip
+                    .userspace_kernel_boundary()
+                    .set_syscall_return_value(
+                        self.mem_start(),
+                        self.app_break.get(),
+                        stored_state,
+                        return_value,
+                    )
+            }
+        }) {
+            Some(Ok(())) => {
+                // If we get an `Ok` we are all set.
+
+                // The process is either already in the running state (having
+                // just called a nonblocking syscall like command) or needs to
+                // be moved to the running state having called Yield-WaitFor and
+                // now needing to be resumed. Either way we can set the state to
+                // running.
+                self.state.set(State::Running);
+                // The task is running, if it was yielded-for an upcall,
+                // the upcall must have been scheduled, unset
+                // the ready flag.
+                self.is_yield_wait_for_ready.set(false);
+            }
+
+            Some(Err(())) => {
+                // If we get an `Err`, then the UKB implementation could not set
+                // the return value, likely because the process's stack is no
+                // longer accessible to it. All we can do is fault.
+                self.set_fault_state();
+            }
+
+            None => {
+                // We should never be here since `stored_state` should always be
+                // occupied.
+                self.set_fault_state();
+            }
+        }
+    }
+
+    fn set_process_function(&self, callback: FunctionCall) {
+        // See if we can actually enqueue this function for this process.
+        // Architecture-specific code handles actually doing this since the
+        // exact method is both architecture- and implementation-specific.
+        //
+        // This can fail, for example if the process does not have enough memory
+        // remaining.
+        match self.stored_state.map(|stored_state| {
+            // Let the UKB implementation handle setting the process's PC so
+            // that the process executes the upcall function.
+            //
+            // SAFETY: We encapsulate unsafe here because we are guaranteeing
+            // that the memory bounds passed to `set_process_function` are
+            // correct. We know this because we use the start of process memory
+            // and the current `app_break`, and that range is accessible to the
+            // process.
+            unsafe {
+                self.chip.userspace_kernel_boundary().set_process_function(
+                    self.mem_start(),
+                    self.app_break.get(),
+                    stored_state,
+                    callback,
+                )
+            }
+        }) {
+            Some(Ok(())) => {
+                // If we got an `Ok` we are all set and should mark that this
+                // process is ready to be scheduled.
+
+                // Move this process to the "running" state so the scheduler
+                // will schedule it.
+                self.state.set(State::Running);
+            }
+
+            Some(Err(())) => {
+                // If we got an Error, then there was likely not enough room on
+                // the stack to allow the process to execute this function given
+                // the details of the particular architecture this is running
+                // on. This process has essentially faulted, so we mark it as
+                // such.
+                self.set_fault_state();
+            }
+
+            None => {
+                // We should never be here since `stored_state` should always be
+                // occupied.
+                self.set_fault_state();
+            }
+        }
+    }
+
+    fn switch_to(&self) -> Option<syscall::ContextSwitchReason> {
+        // Cannot switch to an invalid process
+        if !self.is_running() {
+            return None;
+        }
+
+        let (switch_reason, stack_pointer) =
+            self.stored_state.map_or((None, None), |stored_state| {
+                // Switch to the process.
+                //
+                // SAFETY: We guarantee that the memory pointers we pass are valid,
+                // ensuring this context switch is safe. We know this because we use
+                // the start of process memory and the current `app_break`, and that
+                // range is accessible to the process. Therefore we encapsulate the
+                // `unsafe`.
+                unsafe {
+                    let (switch_reason, optional_stack_pointer) = self
+                        .chip
+                        .userspace_kernel_boundary()
+                        .switch_to_process(self.mem_start(), self.app_break.get(), stored_state);
+                    (Some(switch_reason), optional_stack_pointer)
+                }
+            });
+
+        // If the UKB implementation passed us a stack pointer, update our
+        // debugging state. This is completely optional.
+        if let Some(sp) = stack_pointer {
+            self.debug.set_new_app_stack_min_pointer(sp);
+        }
+
+        switch_reason
+    }
+
+    fn debug_syscall_count(&self) -> usize {
+        self.debug.get_syscall_count()
+    }
+
+    fn debug_dropped_upcall_count(&self) -> usize {
+        self.debug.get_dropped_upcall_count()
+    }
+
+    fn debug_timeslice_expiration_count(&self) -> usize {
+        self.debug.get_timeslice_expiration_count()
+    }
+
+    fn debug_timeslice_expired(&self) {
+        self.debug.increment_timeslice_expiration_count();
+    }
+
+    fn debug_syscall_called(&self, last_syscall: Syscall) {
+        self.debug.increment_syscall_count();
+        self.debug.set_last_syscall(last_syscall);
+    }
+
+    fn debug_syscall_last(&self) -> Option<Syscall> {
+        self.debug.get_last_syscall()
+    }
+
+    fn get_addresses(&self) -> ProcessAddresses {
+        ProcessAddresses {
+            flash_start: self.flash_start() as usize,
+            flash_non_protected_start: self.flash_non_protected_start(),
+            flash_integrity_end: self
+                .flash
+                .as_ptr()
+                .wrapping_add(self.header.get_binary_end() as usize),
+            flash_end: self.flash_end(),
+            sram_start: self.mem_start() as usize,
+            sram_app_brk: self.app_memory_break() as usize,
+            sram_grant_start: self.kernel_memory_break() as usize,
+            sram_end: self.mem_end() as usize,
+            sram_heap_start: self.debug.get_app_heap_start_pointer().map(|p| p as usize),
+            sram_stack_top: self.debug.get_app_stack_start_pointer().map(|p| p as usize),
+            sram_stack_bottom: self.debug.get_app_stack_min_pointer().map(|p| p as usize),
+        }
+    }
+
+    fn get_sizes(&self) -> ProcessSizes {
+        ProcessSizes {
+            grant_pointers: mem::size_of::<GrantPointerEntry>()
+                * self.kernel.get_grant_count_and_finalize(),
+            upcall_list: Self::CALLBACKS_SIZE,
+            process_control_block: Self::PROCESS_STRUCT_SIZE,
+        }
+    }
+
+    fn print_full_process(&self, writer: &mut dyn Write) {
+        if !config::CONFIG.debug_panics {
+            return;
+        }
+
+        self.stored_state.map(|stored_state| {
+            // SAFETY: We guarantee the memory bounds pointers provided to the
+            // UKB are correct. We know this because we use the start of process
+            // memory and the current `app_break`, and that range is accessible
+            // to the process.
+            unsafe {
+                self.chip.userspace_kernel_boundary().print_context(
+                    self.mem_start(),
+                    self.app_break.get(),
+                    stored_state,
+                    writer,
+                );
+            }
+        });
+
+        // Display grant information.
+        let number_grants = self.kernel.get_grant_count_and_finalize();
+        let _ = writer.write_fmt(format_args!(
+            "\
+            \r\n Total number of grant regions defined: {}\r\n",
+            self.kernel.get_grant_count_and_finalize()
+        ));
+        let rows = number_grants.div_ceil(3);
+
+        // Access our array of grant pointers.
+        self.grant_pointers.map(|grant_pointers| {
+            // Iterate each grant and show its address.
+            for i in 0..rows {
+                for j in 0..3 {
+                    let index = i + (rows * j);
+                    if index >= number_grants {
+                        break;
+                    }
+
+                    // Implement `grant_pointers[grant_num]` without a chance of
+                    // a panic.
+                    grant_pointers.get(index).map(|grant_entry| {
+                        if grant_entry.grant_ptr.is_null() {
+                            let _ =
+                                writer.write_fmt(format_args!("  Grant {:>2} : --        ", index));
+                        } else {
+                            let _ = writer.write_fmt(format_args!(
+                                "  Grant {:>2} {:#x}: {:p}",
+                                index, grant_entry.driver_num, grant_entry.grant_ptr
+                            ));
+                        }
+                    });
+                }
+                let _ = writer.write_fmt(format_args!("\r\n"));
+            }
+        });
+
+        // Display the current state of the MPU for this process.
+        self.mpu_config.map(|config| {
+            let _ = writer.write_fmt(format_args!("{}", config));
+        });
+
+        // Print a helpful message on how to re-compile a process to view the
+        // listing file. If a process is PIC, then we also need to print the
+        // actual addresses the process executed at so that the .lst file can be
+        // generated for those addresses. If the process was already compiled
+        // for a fixed address, then just generating a .lst file is fine.
+
+        if self.debug.get_fixed_address_flash().is_some() {
+            // Fixed addresses, can just run `make lst`.
+            let _ = writer.write_fmt(format_args!(
+                "\
+                    \r\nTo debug libtock-c apps, run `make lst` in the app's\
+                    \r\nfolder and open the arch.{:#x}.{:#x}.lst file.\r\n\r\n",
+                self.debug.get_fixed_address_flash().unwrap_or(0),
+                self.debug.get_fixed_address_ram().unwrap_or(0)
+            ));
+        } else {
+            // PIC, need to specify the addresses.
+            let sram_start = self.mem_start() as usize;
+            let flash_start = self.flash.as_ptr() as usize;
+            let flash_init_fn = flash_start + self.header.get_init_function_offset() as usize;
+
+            let _ = writer.write_fmt(format_args!(
+                "\
+                    \r\nTo debug libtock-c apps, run\
+                    \r\n`make debug RAM_START={:#x} FLASH_INIT={:#x}`\
+                    \r\nin the app's folder and open the .lst file.\r\n\r\n",
+                sram_start, flash_init_fn
+            ));
+        }
+    }
+
+    fn get_stored_state(&self, out: &mut [u8]) -> Result<usize, ErrorCode> {
+        self.stored_state
+            .map(|stored_state| {
+                self.chip
+                    .userspace_kernel_boundary()
+                    .store_context(stored_state, out)
+            })
+            .unwrap_or(Err(ErrorCode::FAIL))
+    }
+}
+
+impl<C: 'static + Chip, D: 'static + ProcessStandardDebug> ProcessStandard<'_, C, D> {
+    /// Alignment requirement for each `GrantPointerEntry` in the grant pointers
+    /// slice.
+    const GRANT_POINTERS_ALIGNMENT: usize = mem::align_of::<GrantPointerEntry>();
+
+    /// Number of upcalls stored in the upcall ring buffer (10 element length).
+    const CALLBACK_LEN: usize = 10;
+    /// Size of the upcall storage buffer.
+    ///
+    /// As of June 2026, we cannot do
+    ///
+    /// ```ignore
+    /// const CALLBACKS_SIZE usize = mem::size_of::<MaybeUninit<[Task; Self::CALLBACK_LEN]>>();
+    /// ```
+    ///
+    /// because of the error:
+    ///
+    /// ```text
+    /// error: generic `Self` types are currently not permitted in anonymous constants
+    ///     --> kernel/src/process_standard.rs:1712:70
+    ///      |
+    /// 1712 |     const CALLBACKS_SIZE: usize = mem::size_of::<MaybeUninit<[Task; Self::CALLBACK_LEN]>>();
+    ///      |                                                                      ^^^^
+    ///      |
+    /// ```
+    const CALLBACKS_SIZE: usize = mem::size_of::<Task>() * Self::CALLBACK_LEN;
+    /// Alignment requirement of the upcall storage buffer.
+    const CALLBACKS_ALIGNMENT: usize = mem::align_of::<Task>();
+
+    // Memory offset to make room for this process's control block.
+    const PROCESS_STRUCT_SIZE: usize = mem::size_of::<ProcessStandard<C, D>>();
+    /// Alignment requirement for `ProcessStandard`.
+    const PROCESS_STRUCT_ALIGNMENT: usize = mem::align_of::<ProcessStandard<C, D>>();
+
+    /// Create a `ProcessStandard` object based on the found `ProcessBinary`.
+    ///
+    /// # Safety
+    ///
+    /// This function allocates memory from `remaining_memory` for use by the
+    /// process. There must not be any references to or other uses of
+    /// `remaining_memory` when calling this function.
+    pub(crate) unsafe fn create(
+        kernel: &'static Kernel,
+        chip: &'static C,
+        pb: ProcessBinary,
+        remaining_memory: *mut [u8],
+        fault_policy: &'static dyn ProcessFaultPolicy,
+        storage_permissions_policy: &'static dyn ProcessStandardStoragePermissionsPolicy<C, D>,
+        app_id: ShortId,
+        index: usize,
+    ) -> Result<(Option<&'static dyn Process>, *mut [u8]), (ProcessLoadError, *mut [u8])> {
+        let process_name = pb.header.get_package_name();
+        let process_ram_requested_size = pb.header.get_minimum_app_ram_size() as usize;
+
+        // Initialize MPU region configuration.
+        let mut mpu_config = match chip.mpu().new_config() {
+            Some(mpu_config) => mpu_config,
+            None => return Err((ProcessLoadError::MpuConfigurationError, remaining_memory)),
+        };
+
+        // Allocate MPU region for flash.
+        if chip
+            .mpu()
+            .allocate_region(
+                pb.flash.as_ptr(),
+                pb.flash.len(),
+                pb.flash.len(),
+                mpu::Permissions::ReadExecuteOnly,
+                &mut mpu_config,
+            )
+            .is_none()
+        {
+            if config::CONFIG.debug_load_processes {
+                debug!(
+                    "[!] flash={:#010X}-{:#010X} process={:?} - couldn't allocate MPU region for flash",
+                    pb.flash.as_ptr() as usize,
+                    pb.flash.as_ptr() as usize + pb.flash.len() - 1,
+                    process_name
+                );
+            }
+            return Err((ProcessLoadError::MpuInvalidFlashLength, remaining_memory));
+        }
+
+        // Determine how much space we need in the application's memory space
+        // just for kernel and grant state. We need to make sure we allocate
+        // enough memory just for that.
+
+        // Calculate how many bytes we need for grant pointers.
+        let grant_ptr_size = mem::size_of::<GrantPointerEntry>();
+        let grant_ptrs_num = kernel.get_grant_count_and_finalize();
+        let grant_ptrs_size = grant_ptrs_num * grant_ptr_size;
+
+        // Initial size of the kernel-owned part of process memory can be
+        // calculated directly based on the initial size of all kernel-owned
+        // data structures.
+        //
+        // Add the alignment size of each data structure to handle the case
+        // where the memory region starts at the worst possible address and we
+        // need to add padding. Note: the maximum shift will only ever be one
+        // less than the alignment size, but to avoid unusual addresses we just
+        // use the full alignment.
+        let initial_kernel_memory_size = grant_ptrs_size
+            + Self::GRANT_POINTERS_ALIGNMENT
+            + Self::CALLBACKS_SIZE
+            + Self::CALLBACKS_ALIGNMENT
+            + Self::PROCESS_STRUCT_SIZE
+            + Self::PROCESS_STRUCT_ALIGNMENT;
+
+        // By default we start with the initial size of process-accessible
+        // memory set to 0. This maximizes the flexibility that processes have
+        // to allocate their memory as they see fit. If a process needs more
+        // accessible memory it must use the `brk` memop syscalls to request
+        // more memory.
+        //
+        // We must take into account any process-accessible memory required by
+        // the context switching implementation and allocate at least that much
+        // memory so that we can successfully switch to the process. This is
+        // architecture and implementation specific, so we query that now.
+        let min_process_memory_size = chip
+            .userspace_kernel_boundary()
+            .initial_process_app_brk_size();
+
+        // We have to ensure that we at least ask the MPU for
+        // `min_process_memory_size` so that we can be sure that `app_brk` is
+        // not set inside the kernel-owned memory region. Now, in practice,
+        // processes should not request 0 (or very few) bytes of memory in their
+        // TBF header (i.e. `process_ram_requested_size` will almost always be
+        // much larger than `min_process_memory_size`), as they are unlikely to
+        // work with essentially no available memory. But, we still must protect
+        // for that case.
+        let min_process_ram_size = cmp::max(process_ram_requested_size, min_process_memory_size);
+
+        // Minimum memory size for the process.
+        let min_total_memory_size = min_process_ram_size + initial_kernel_memory_size;
+
+        // Check if this process requires a fixed memory start address. If so,
+        // try to adjust the memory region to work for this process.
+        //
+        // Right now, we only support skipping some RAM and leaving a chunk
+        // unused so that the memory region starts where the process needs it
+        // to.
+        let remaining_memory = if let Some(fixed_memory_start) = pb
+            .header
+            .get_fixed_address_ram()
+            .map(|addr: u32| remaining_memory.cast::<u8>().with_addr(addr as usize))
+        {
+            // The process does have a fixed address.
+            if fixed_memory_start == remaining_memory.cast() {
+                // Address already matches.
+                remaining_memory
+            } else if fixed_memory_start > remaining_memory.cast() {
+                // Process wants a memory address farther in memory. Try to
+                // advance the memory region to make the address match.
+                let diff = fixed_memory_start.addr() - remaining_memory.addr();
+                if diff > remaining_memory.len() {
+                    // We ran out of memory.
+                    let actual_address = (remaining_memory.cast::<u8>())
+                        .wrapping_byte_add(remaining_memory.len())
+                        .wrapping_byte_sub(1);
+                    let expected_address = fixed_memory_start;
+                    return Err((
+                        ProcessLoadError::MemoryAddressMismatch {
+                            actual_address,
+                            expected_address,
+                        },
+                        remaining_memory,
+                    ));
+                } else {
+                    // Change the memory range to start where the process requested it.
+                    // Because of the if statement above we know this should work. Doing
+                    // it more cleanly would be good but was a bit beyond my borrow ken;
+                    // calling get_mut has a mutable borrow.-pal
+                    //
+                    // SAFETY: `diff` must be within the `remaining_memory` slice. Because we
+                    // check that `diff` is less than the length of `remaining_memory`
+                    // we know diff will be within  `remaining_memory`.
+                    let (_, sliced) = unsafe { raw_slice_split_at_mut(remaining_memory, diff) };
+                    sliced
+                }
+            } else {
+                // Address is earlier in memory, nothing we can do.
+                let actual_address = remaining_memory.cast();
+                let expected_address = fixed_memory_start;
+                return Err((
+                    ProcessLoadError::MemoryAddressMismatch {
+                        actual_address,
+                        expected_address,
+                    },
+                    remaining_memory,
+                ));
+            }
+        } else {
+            remaining_memory
+        };
+
+        // Determine where process memory will go and allocate an MPU region.
+        //
+        // `[allocation_start, allocation_size)` will cover both
+        //
+        // - the app-owned `min_process_memory_size`-long part of memory (at
+        //   some offset within `remaining_memory`), as well as
+        //
+        // - the kernel-owned allocation growing downward starting at the end
+        //   of this allocation, `initial_kernel_memory_size` bytes long.
+        //
+        let (allocation_start, allocation_size) = match chip.mpu().allocate_app_memory_region(
+            remaining_memory.cast(),
+            remaining_memory.len(),
+            min_total_memory_size,
+            min_process_memory_size,
+            initial_kernel_memory_size,
+            mpu::Permissions::ReadWriteOnly,
+            &mut mpu_config,
+        ) {
+            Some((memory_start, memory_size)) => (memory_start, memory_size),
+            None => {
+                // Failed to load process. Insufficient memory.
+                if config::CONFIG.debug_load_processes {
+                    debug!(
+                        "[!] flash={:#010X}-{:#010X} process={:?} - couldn't allocate memory region of size >= {:#X}",
+                        pb.flash.as_ptr() as usize,
+                        pb.flash.as_ptr() as usize + pb.flash.len() - 1,
+                        process_name,
+                        min_total_memory_size
+                    );
+                }
+                return Err((ProcessLoadError::NotEnoughMemory, remaining_memory));
+            }
+        };
+
+        // Determine the offset of the app-owned part of the above memory
+        // allocation. An MPU may not place it at the very start of
+        // `remaining_memory` for internal alignment constraints. This can only
+        // overflow if the MPU implementation is incorrect; a compliant
+        // implementation must return a memory allocation within the
+        // `remaining_memory` slice.
+        let app_memory_start_offset = allocation_start.addr() - remaining_memory.addr();
+
+        // Check if the memory region is valid for the process. If a process
+        // included a fixed address for the start of RAM in its TBF header (this
+        // field is optional, processes that are position independent do not
+        // need a fixed address) then we check that we used the same address
+        // when we allocated it in RAM.
+        if let Some(fixed_memory_start) = pb
+            .header
+            .get_fixed_address_ram()
+            .map(|addr: u32| remaining_memory.cast::<u8>().with_addr(addr as usize))
+        {
+            let actual_address = remaining_memory
+                .cast::<u8>()
+                .wrapping_byte_add(app_memory_start_offset);
+            let expected_address = fixed_memory_start;
+            if actual_address != expected_address {
+                return Err((
+                    ProcessLoadError::MemoryAddressMismatch {
+                        actual_address,
+                        expected_address,
+                    },
+                    remaining_memory,
+                ));
+            }
+        }
+
+        // With our MPU allocation, we can begin to divide up the
+        // `remaining_memory` slice into individual regions for the process and
+        // kernel, as follows:
+        //
+        //
+        //  ┌───────────────────────────────────────────────────────────────────────────────────────
+        //  │ remaining_memory
+        //  └───────────────────────────────────────────────────────────────────────────────────────
+        //  ┆                                                                        ┆
+        //  ┌────────────────────────────────────────────────────────────────────────┬──────────────
+        //  │ allocated_padded_memory                                                │ unused_memory
+        //  └────────────────────────────────────────────────────────────────────────┴──────────────
+        //      ┆                                                                    ┆
+        //      ┌────────────────────────────────────────────────────────────────────┐
+        //  ┆←─→│ allocated_memory                                                   │
+        //    ↑ └────────────────────────────────────────────────────────────────────┘
+        //    └┄┄┄app_memory_start_offset                                            ┆
+        //      ┌─────────────────────────┬──────────────────────────────────────────┐
+        //      │ app_accessible_memory   │ allocated_kernel_memory                  │
+        //      └─────────────────────────┴──────────────────────────────────────────┘
+        //      ┆←min_process_memory_size→┆←────→┆←────initial_kernel_memory_size───→┆
+        //                                ↑  ↑   ┆                                   ┆
+        //              initial_app_brk┄┄┄┘  ┆   ┆ ┌┄┄┄kernel_memory_break           ┆
+        //           initially unallocated┄┄┄┘   ┆ ↓                                 ┆
+        //                                       ┆ ┌───────┬──────────┬──────────────┐
+        //                                       ┆↔│process│upcall_buf│grant_pointers│
+        //                                       ┆ └───────┴──────────┴──────────────┘
+        //                                        ↑       ↑          ↑              ↑
+        //             possible alignment padding┄┴┄┄┄┄┄┄┄┴┄┄┄┄┄┄┄┄┄┄┴┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘
+        //
+        //
+        // First split the `remaining_memory` into two slices:
+        //
+        // 1. `allocated_padded_memory`: the allocated memory region, containing:
+        //
+        //    1. optional padding at the start of the memory region of
+        //       `app_memory_start_offset` bytes,
+        //    2. the app accessible memory region of `min_process_memory_size`,
+        //    3. optional unallocated memory, and
+        //    4. kernel-reserved memory, growing downward starting at the end of
+        //       `allocated_memory`.
+        //
+        // 2. `unused_memory`: the rest of the `remaining_memory`, not assigned
+        //    to this app.
+        //
+        // SAFETY: `app_memory_start_offset + allocation_size` must be within `remaining_memory`.
+        let (allocated_padded_memory, unused_memory) = unsafe {
+            raw_slice_split_at_mut(remaining_memory, app_memory_start_offset + allocation_size)
+        };
+
+        // Now, slice off the (optional) padding at the start:
+        //
+        // SAFETY: `app_memory_start_offset` must be within `allocated_padded_memory`.
+        let (_padding, allocated_memory) =
+            unsafe { raw_slice_split_at_mut(allocated_padded_memory, app_memory_start_offset) };
+
+        // We continue to sub-slice the `allocated_memory` into
+        // process-accessible and kernel-owned memory. Prior to that, store the
+        // start and length ofthe overall allocation:
+        let allocated_memory_start = allocated_memory.cast();
+        let allocated_memory_len = allocated_memory.len();
+
+        // Slice off the process-accessible memory:
+        //
+        // SAFETY: `min_process_memory_size` must be within `allocated_memory`.
+        let (app_accessible_memory, allocated_kernel_memory) =
+            unsafe { raw_slice_split_at_mut(allocated_memory, min_process_memory_size) };
+
+        // Initialize (zero) the initial process-accessible memory region. This
+        // serves two purposes:
+        //
+        // 1. It prevents a process from accessing any information still
+        //    contained in this memory from prior kernel instances or processes.
+        //
+        // 2. It satisfies Rust's requirements that all dereferencable memory be
+        //    properly initialized. This is important, as we'll be creating
+        //    references into this process-accessible memory region through the
+        //    process buffer infrastructure.
+        let app_accessible_memory_bytes: *mut u8 = app_accessible_memory.cast();
+        // SAFETY: `app_accessible_memory_bytes` is from a slice, and we use that
+        // slice's length, so we know that there is enough memory and that the
+        // pointer is aligned.
+        unsafe {
+            core::ptr::write_bytes(
+                app_accessible_memory_bytes,
+                // Set the entire app-accessible memory region to `0`:
+                0_u8,
+                app_accessible_memory.len(),
+            );
+        }
+
+        // Set the initial process-accessible memory.
+        //
+        // SAFETY: By using the slice `app_accessible_memory` and getting a pointer to
+        // the byte after the slice, we are ensured that the memory between the
+        // start of the allocation and the new pointer (at the end of the slice)
+        // is valid because of the existing slice.
+        let initial_app_brk = unsafe {
+            app_accessible_memory
+                .cast::<u8>()
+                .add(app_accessible_memory.len())
+        };
+
+        // Set the initial allow high water mark to the start of process memory
+        // since no `allow` calls have been made yet.
+        let initial_allow_high_water_mark = app_accessible_memory.cast();
+
+        // Set up initial grant region.
+        //
+        // `kernel_memory_break` is set to the end of kernel-accessible memory
+        // and grows downward.
+        let mut kernel_memory_break: *mut u8 = allocated_kernel_memory
+            .cast::<u8>()
+            .wrapping_add(allocated_kernel_memory.len());
+
+        ////////////////////////
+        // Grant Region Pointers
+        ////////////////////////
+
+        // Now that we know we have the space we can setup the grant pointers.
+        //
+        // First, move `kernel_memory_break` up to make room for the grant pointers.
+        kernel_memory_break = kernel_memory_break.wrapping_sub(grant_ptrs_size);
+        // Next, use the extra alignment padding we factored in to the total
+        // calculation of `initial_kernel_memory_size` to ensure that
+        // `kernel_memory_break` is aligned to a `GrantPointerEntry`.
+        kernel_memory_break = kernel_memory_break
+            .wrapping_sub(kernel_memory_break as usize % Self::GRANT_POINTERS_ALIGNMENT);
+
+        // Create the `GrantPointerEntry`s in the kernel region, then initialize
+        // them.
+        //
+        // Where we calculated the updated kernel_memory_break is where the
+        // `GrantPointerEntry`s start.
+        let grant_pointers_memory_location: *mut MaybeUninit<GrantPointerEntry> =
+            kernel_memory_break.cast();
+        // Get a reference to the slice of `GrantPointerEntry`s.
+        //
+        // SAFETY: This is safe, as `grant_pointers_memory_location` is aligned to a
+        // `GrantPointerEntry`, and we ensured there is space for
+        // `grant_ptrs_num` of `GrantPointerEntry`s allocated.
+        let grant_pointers_uninit: &mut [MaybeUninit<GrantPointerEntry>] =
+            unsafe { slice::from_raw_parts_mut(grant_pointers_memory_location, grant_ptrs_num) };
+        // Set all grant pointers to null.
+        for grant_entry in grant_pointers_uninit.iter_mut() {
+            grant_entry.write(GrantPointerEntry {
+                driver_num: 0,
+                grant_ptr: core::ptr::null_mut(),
+            });
+        }
+        // SAFETY: All values in this slice have been properly initialized.
+        let grant_pointers = unsafe { maybe_uninit_slice_assume_init_mut(grant_pointers_uninit) };
+
+        ////////////////////////
+        // Upcall Queue
+        ////////////////////////
+
+        // Now that we know we have the space we can setup the memory for the
+        // upcalls.
+        //
+        // Move our `kernel_memory_break` up the size of the callback slice.
+        kernel_memory_break = kernel_memory_break.wrapping_sub(Self::CALLBACKS_SIZE);
+        // Use the space we allocated for alignment in case the pointer is not aligned.
+        kernel_memory_break = kernel_memory_break
+            .wrapping_sub(kernel_memory_break as usize % Self::CALLBACKS_ALIGNMENT);
+
+        // Set up ring buffer for upcalls to the process. The memory is uninitialized here,
+        // so we cast to MaybeUninit<Task> which accurately represents that state.
+        let upcall_buf: *mut core::mem::MaybeUninit<Task> = kernel_memory_break.cast();
+
+        // Get a reference `&mut [Task; Self:CALLBACK_LEN]`
+        //
+        // SAFETY: This needs to be aligned and have allocated space for
+        // `Self::CALLBACK_LEN` instances of `Task`. We ensured there is enough
+        // space when we allocated `allocated_kernel_memory` and we moved
+        // kernel_memory_break up to fit the callbacks. We ensured this is
+        // aligned by moving `kernel_memory_break` up if needed, and we
+        // accounted for that potential increase in size when we allocated
+        // `allocated_kernel_memory`.
+        let upcall_buf = unsafe { slice::from_raw_parts_mut(upcall_buf, Self::CALLBACK_LEN) };
+        // Actually setup the ring buffer.
+        let tasks = RingBuffer::new(upcall_buf);
+
+        ////////////////////////
+        // ProcessStandard
+        ////////////////////////
+
+        // Last thing in the kernel region of process RAM is the process struct.
+        //
+        // Move `kernel_memory_break` to make room for the `ProcessStandard` struct.
+        kernel_memory_break = kernel_memory_break.wrapping_sub(Self::PROCESS_STRUCT_SIZE);
+        // Use the space we allocated for alignment in case the pointer is not aligned.
+        kernel_memory_break = kernel_memory_break
+            .wrapping_sub(kernel_memory_break as usize % Self::PROCESS_STRUCT_ALIGNMENT);
+
+        // Create a pointer to where the `ProcessStandard` struct will go in the
+        // app grant region.
+        let process_struct_memory_location: *mut MaybeUninit<ProcessStandard<'static, C, D>> =
+            kernel_memory_break.cast();
+        // Get a reference to the uninitialized `ProcessStandard` object.
+        //
+        // Note, this requires every field be explicitly initialized, as we are
+        // just transforming a pointer into a structure. Because the
+        // `ProcessStandard` is not initialized we mark it with `MaybeUninit`.
+        //
+        // SAFETY: This must have sufficient allocated space and proper alignment. When
+        // we sized `allocated_kernel_memory` we ensured there was room for the
+        // entire `ProcessStandard` struct. We also allocated space for
+        // potential alignment issues, and ensured `kernel_memory_break` was
+        // properly aligned for `ProcessStandard`.
+        let process_uninit: &mut MaybeUninit<ProcessStandard<C, D>> =
+            unsafe { &mut *process_struct_memory_location };
+
+        // Initialize ALL fields of `ProcessStandard`.
+        //
+        // SAFETY: These need to be valid and aligned writes. When we create the `MaybeUnint`
+        // ProcessStandard struct we ensure there is valid memory for the object and
+        // that it is aligned.
+        unsafe {
+            init_uninit_struct!(process_uninit => ProcessStandard<C, D> {
+                process_id: Cell::new(ProcessId::new(
+                    kernel,
+                    kernel.create_process_identifier(),
+                    index,
+                )),
+                app_id: app_id,
+                kernel: kernel,
+                chip: chip,
+                allow_high_water_mark: Cell::new(initial_allow_high_water_mark),
+                memory_start: allocated_memory_start,
+                memory_len: allocated_memory_len,
+                header: pb.header,
+                kernel_memory_break: Cell::new(kernel_memory_break),
+                app_break: Cell::new(initial_app_brk),
+                grant_pointers: MapCell::new(grant_pointers),
+
+                credential: pb.credential.get(),
+                footers: pb.footers,
+                flash: pb.flash,
+
+                stored_state: MapCell::new(Default::default()),
+                state: Cell::new(State::Yielded),
+                fault_policy: fault_policy,
+                restart_count: Cell::new(0),
+                completion_code: OptionalCell::empty(),
+
+                storage_permissions: Cell::new(StoragePermissions::new_null()),
+
+                mpu_config: MapCell::new(mpu_config),
+                mpu_regions: [
+                    Cell::new(None),
+                    Cell::new(None),
+                    Cell::new(None),
+                    Cell::new(None),
+                    Cell::new(None),
+                    Cell::new(None),
+                ],
+                tasks: MapCell::new(tasks),
+                is_yield_wait_for_ready: Cell::new(false),
+
+                debug: D::default(),
+            });
+        }
+
+        // Convert the originally uninitialized `ProcessStandard` to a proper
+        // `ProcessStandard` struct reference.
+        //
+        // SAFETY: All fields in `ProcessStandard` must be initialized. We guaranteed
+        // this by using the `init_uninit_struct!()` macro, which causes a
+        // compiler error if there is a missing field.
+        let process = unsafe { process_uninit.assume_init_mut() };
+
+        // Save copies of these in case the app was compiled for fixed addresses
+        // for later debugging.
+        let fixed_address_flash = process.header.get_fixed_address_flash();
+        let fixed_address_ram = process.header.get_fixed_address_ram();
+        if let Some(fix_addr_flash) = fixed_address_flash {
+            process.debug.set_fixed_address_flash(fix_addr_flash);
+        }
+        if let Some(fix_addr_ram) = fixed_address_ram {
+            process.debug.set_fixed_address_ram(fix_addr_ram);
+        }
+
+        // Handle any architecture-specific requirements for a new process.
+        match process.stored_state.map(|stored_state| {
+            // SAFETY: NOTE! We have to ensure that the start of process-accessible memory
+            // (`app_memory_start`) is word-aligned. Since we currently start
+            // process-accessible memory at the beginning of the allocated memory
+            // region, we trust the MPU to give us a word-aligned starting address.
+            //
+            // TODO: https://github.com/tock/tock/issues/1739
+            unsafe {
+                chip.userspace_kernel_boundary().initialize_process(
+                    app_accessible_memory.cast(),
+                    initial_app_brk,
+                    stored_state,
+                )
+            }
+        }) {
+            Some(Ok(())) => {}
+            _ => {
+                if config::CONFIG.debug_load_processes {
+                    debug!(
+                        "[!] flash={:#010X}-{:#010X} process={:?} - couldn't initialize process",
+                        pb.flash.as_ptr() as usize,
+                        pb.flash.as_ptr() as usize + pb.flash.len() - 1,
+                        process_name
+                    );
+                }
+                // Note that since remaining_memory was split by split_at_mut into
+                // application memory and unused_memory, a failure here will leak
+                // the application memory. Not leaking it requires being able to
+                // reconstitute the original memory slice.
+                return Err((ProcessLoadError::InternalError, unused_memory));
+            }
+        }
+
+        let flash_start: *const u8 = process.flash.as_ptr();
+        let app_start =
+            flash_start.wrapping_add(process.header.get_app_start_offset() as usize) as usize;
+        let init_addr: *const () = flash_start
+            .wrapping_add(process.header.get_init_function_offset() as usize)
+            .cast();
+        let fn_base = flash_start as usize;
+        let fn_len = process.flash.len();
+
+        // We need to construct a capability with sufficient authority to cover
+        // all of a user's code, with permissions to execute it. The entirety
+        // of this process's flash is sufficient.
+        //
+        // SAFETY: It must be safe for this process to access the
+        // bounds+permission expressed here while assuming no other protection
+        // mechanism is active.
+        //  - It is valid under Tock's threat model for a process to try to
+        //  execute anything within process-owned flash.
+        //  - `process.flash` which we use to derive the bounds is defined as
+        //  process-owned flash for a well-formed process, which we trust is
+        //  the case here.
+        //  - We grant only execute permission.
+        //  - We only pass this pointer to this process.
+        let init_fn = unsafe {
+            CapabilityPtr::new_with_authority(
+                init_addr,
+                fn_base,
+                fn_len,
+                CapabilityPtrPermissions::Execute,
+            )
+        };
+
+        process.tasks.map(|tasks| {
+            tasks.enqueue(Task::FunctionCall(FunctionCall {
+                source: FunctionCallSource::Kernel,
+                pc: init_fn,
+                argument0: app_start,
+                argument1: process.memory_start as usize,
+                argument2: process.memory_len,
+                argument3: (process.app_break.get() as usize).into(),
+            }));
+        });
+
+        // Set storage permissions. Put this at the end so that `process` is
+        // completely formed before using it to determine the storage
+        // permissions.
+        process
+            .storage_permissions
+            .set(storage_permissions_policy.get_permissions(process));
+
+        // Return the process object and a remaining memory for processes slice.
+        Ok((Some(process), unused_memory))
+    }
+
+    /// Reset the process, resetting all of its state and re-initializing it so
+    /// it can start running. Assumes the process is not running but is still in
+    /// flash and still has its memory region allocated to it.
+    fn reset(&self) -> Result<(), ErrorCode> {
+        // We need a new process identifier for this process since the restarted
+        // version is in effect a new process. This is also necessary to
+        // invalidate any stored `ProcessId`s that point to the old version of
+        // the process. However, the process has not moved locations in the
+        // processes array, so we copy the existing index.
+        let old_index = self.process_id.get().index;
+        let new_identifier = self.kernel.create_process_identifier();
+        self.process_id
+            .set(ProcessId::new(self.kernel, new_identifier, old_index));
+
+        // Reset debug information that is per-execution and not per-process.
+        self.debug.reset_last_syscall();
+        self.debug.reset_syscall_count();
+        self.debug.reset_dropped_upcall_count();
+        self.debug.reset_timeslice_expiration_count();
+
+        // Reset MPU region configuration.
+        //
+        // TODO: ideally, this would be moved into a helper function used by
+        // both create() and reset(), but process load debugging complicates
+        // this. We just want to create new config with only flash and memory
+        // regions.
+        //
+        // We must have a previous MPU configuration stored, fault the
+        // process if this invariant is violated. We avoid allocating
+        // a new MPU configuration, as this may eventually exhaust the
+        // number of available MPU configurations.
+        let mut mpu_config = self.mpu_config.take().ok_or(ErrorCode::FAIL)?;
+        self.chip.mpu().reset_config(&mut mpu_config);
+
+        // Allocate MPU region for flash.
+        let app_mpu_flash = self.chip.mpu().allocate_region(
+            self.flash.as_ptr(),
+            self.flash.len(),
+            self.flash.len(),
+            mpu::Permissions::ReadExecuteOnly,
+            &mut mpu_config,
+        );
+        if app_mpu_flash.is_none() {
+            // We were unable to allocate an MPU region for flash. This is very
+            // unexpected since we previously ran this process. However, we
+            // return now and leave the process faulted and it will not be
+            // scheduled.
+            return Err(ErrorCode::FAIL);
+        }
+
+        // RAM
+
+        // Re-determine the minimum amount of RAM the kernel must allocate to
+        // the process based on the specific requirements of the syscall
+        // implementation.
+        let min_process_memory_size = self
+            .chip
+            .userspace_kernel_boundary()
+            .initial_process_app_brk_size();
+
+        // Recalculate initial_kernel_memory_size as was done in create()
+        let grant_ptr_size = mem::size_of::<GrantPointerEntry>();
+        let grant_ptrs_num = self.kernel.get_grant_count_and_finalize();
+        let grant_ptrs_size = grant_ptrs_num * grant_ptr_size;
+
+        let initial_kernel_memory_size = grant_ptrs_size
+            + Self::GRANT_POINTERS_ALIGNMENT
+            + Self::CALLBACKS_SIZE
+            + Self::CALLBACKS_ALIGNMENT
+            + Self::PROCESS_STRUCT_SIZE
+            + Self::PROCESS_STRUCT_ALIGNMENT;
+
+        let app_mpu_mem = self.chip.mpu().allocate_app_memory_region(
+            self.mem_start(),
+            self.memory_len,
+            self.memory_len, //we want exactly as much as we had before restart
+            min_process_memory_size,
+            initial_kernel_memory_size,
+            mpu::Permissions::ReadWriteOnly,
+            &mut mpu_config,
+        );
+        let (app_mpu_mem_start, app_mpu_mem_len) = match app_mpu_mem {
+            Some((start, len)) => (start, len),
+            None => {
+                // We couldn't configure the MPU for the process. This shouldn't
+                // happen since we were able to start the process before, but at
+                // this point it is better to leave the app faulted and not
+                // schedule it.
+                return Err(ErrorCode::NOMEM);
+            }
+        };
+
+        // Reset memory pointers now that we know the layout of the process
+        // memory and know that we can configure the MPU.
+
+        // app_brk is set based on minimum syscall size above the start of
+        // memory.
+        let app_brk = app_mpu_mem_start.wrapping_add(min_process_memory_size);
+        self.app_break.set(app_brk);
+        // kernel_brk is calculated backwards from the end of memory the size of
+        // the initial kernel data structures.
+        let kernel_brk = app_mpu_mem_start
+            .wrapping_add(app_mpu_mem_len)
+            .wrapping_sub(initial_kernel_memory_size);
+        self.kernel_memory_break.set(kernel_brk);
+        // High water mark for `allow`ed memory is reset to the start of the
+        // process's memory region.
+        self.allow_high_water_mark.set(app_mpu_mem_start);
+
+        // Store the adjusted MPU configuration:
+        self.mpu_config.replace(mpu_config);
+
+        // Handle any architecture-specific requirements for a process when it
+        // first starts (as it would when it is new).
+        let ukb_init_process = self.stored_state.map_or(Err(()), |stored_state| {
+            // SAFETY: The memory bounds must be valid for this process. We know
+            // this is true here because we use the start of process memory and
+            // the current `app_brk`, and that range is accessible to the
+            // process.
+            unsafe {
+                self.chip.userspace_kernel_boundary().initialize_process(
+                    app_mpu_mem_start,
+                    app_brk,
+                    stored_state,
+                )
+            }
+        });
+        match ukb_init_process {
+            Ok(()) => {}
+            Err(()) => {
+                // We couldn't initialize the architecture-specific state for
+                // this process. This shouldn't happen since the app was able to
+                // be started before, but at this point the app is no longer
+                // valid. The best thing we can do now is leave the app as still
+                // faulted and not schedule it.
+                return Err(ErrorCode::RESERVE);
+            }
+        }
+
+        self.restart_count.increment();
+
+        // Mark the state as `Yielded` for the scheduler.
+        self.state.set(State::Yielded);
+
+        // And queue up this app to be restarted.
+        let flash_start: *const u8 = self.flash_start();
+        let app_start =
+            flash_start.wrapping_add(self.header.get_app_start_offset() as usize) as usize;
+        let init_addr: *const () = flash_start
+            .wrapping_add(self.header.get_init_function_offset() as usize)
+            .cast();
+
+        // We need to construct a capability with sufficient authority to cover
+        // all of a user's code, with permissions to execute it. The entirety
+        // of this process's flash is sufficient.
+        //
+        // SAFETY: It must be safe for this process to access the
+        // bounds+permission expressed here while assuming no other protection
+        // mechanism is active.
+        //  - It is valid under Tock's threat model for a process to try to
+        //  execute anything within process-owned flash.
+        //  - `self.flash` which we use to derive the bounds is defined as
+        //  process-owned flash for a well-formed process, which we trust is
+        //  the case here.
+        //  - We grant only execute permission.
+        //  - We only pass this pointer to this process.
+        let init_fn = unsafe {
+            CapabilityPtr::new_with_authority(
+                init_addr,
+                flash_start as usize,
+                self.flash_end() - (flash_start as usize),
+                CapabilityPtrPermissions::Execute,
+            )
+        };
+
+        self.enqueue_task(Task::FunctionCall(FunctionCall {
+            source: FunctionCallSource::Kernel,
+            pc: init_fn,
+            argument0: app_start,
+            argument1: self.memory_start as usize,
+            argument2: self.memory_len,
+            argument3: (self.app_break.get() as usize).into(),
+        }))
+    }
+
+    /// Checks if the buffer represented by the passed in base pointer and size
+    /// is within the RAM bounds currently exposed to the processes (i.e. ending
+    /// at `app_break`). If this method returns `true`, the buffer is guaranteed
+    /// to be accessible to the process and to not overlap with the grant
+    /// region.
+    fn in_app_owned_memory(&self, buf_start_addr: *const u8, size: usize) -> bool {
+        // TODO: On some platforms, CapabilityPtr has sufficient authority that we
+        // could skip this check.
+        // CapabilityPtr needs to make it slightly further, and we need to add
+        // interfaces that tell us how much assurance it gives on the current
+        // platform.
+        let buf_end_addr = buf_start_addr.wrapping_add(size);
+
+        buf_end_addr >= buf_start_addr
+            && buf_start_addr >= self.mem_start()
+            && buf_end_addr <= self.app_break.get()
+    }
+
+    /// Checks if the buffer represented by the passed in base pointer and size
+    /// are within the readable region of an application's flash memory.  If
+    /// this method returns true, the buffer is guaranteed to be readable to the
+    /// process.
+    fn in_app_flash_memory(&self, buf_start_addr: *const u8, size: usize) -> bool {
+        #![allow(
+            clippy::suspicious_operation_groupings,
+            reason = "false positive on flash_non_protected_start"
+        )]
+
+        // TODO: On some platforms, CapabilityPtr has sufficient authority that we
+        // could skip this check.
+        // CapabilityPtr needs to make it slightly further, and we need to add
+        // interfaces that tell us how much assurance it gives on the current
+        // platform.
+        let buf_end_addr = buf_start_addr.wrapping_add(size);
+
+        buf_end_addr >= buf_start_addr
+            && buf_start_addr.addr() >= self.flash_non_protected_start()
+            && buf_end_addr.addr() <= self.flash_end()
+    }
+
+    /// Allocate memory in a process's grant region.
+    ///
+    /// Ensures that the allocation is of `size` bytes and aligned to `align`
+    /// bytes.
+    ///
+    /// If there is not enough memory, or the MPU cannot isolate the process
+    /// accessible region from the new kernel memory break after doing the
+    /// allocation, then this will return `None`.
+    fn allocate_in_grant_region_internal(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        self.mpu_config.and_then(|config| {
+            // First, compute the candidate new pointer. Note that at this point
+            // we have not yet checked whether there is space for this
+            // allocation or that it meets alignment requirements.
+            let new_break_unaligned = self.kernel_memory_break.get().wrapping_sub(size);
+
+            // Our minimum alignment requirement is two bytes, so that the
+            // lowest bit of the address will always be zero and we can use it
+            // as a flag. It doesn't hurt to increase the alignment (except for
+            // potentially a wasted byte) so we make sure `align` is at least
+            // two.
+            let align = cmp::max(align, 2);
+
+            // The alignment must be a power of two, 2^a. The expression
+            // `!(align - 1)` then returns a mask with leading ones, followed by
+            // `a` trailing zeros.
+            let alignment_mask = !(align - 1);
+            let new_break = new_break_unaligned.map_addr(|a| a & alignment_mask);
+
+            // Verify there is space for this allocation
+            if new_break < self.app_break.get() {
+                None
+                // Verify it didn't wrap around
+            } else if new_break > self.kernel_memory_break.get() {
+                None
+                // Verify this is compatible with the MPU.
+            } else if let Err(()) = self.chip.mpu().update_app_memory_region(
+                self.app_break.get(),
+                new_break,
+                mpu::Permissions::ReadWriteOnly,
+                config,
+            ) {
+                None
+            } else {
+                // Allocation is valid.
+
+                // We always allocate down, so we must lower the
+                // kernel_memory_break.
+                self.kernel_memory_break.set(new_break);
+
+                // We need `grant_ptr` as a mutable pointer.
+                let grant_ptr: *mut u8 = new_break.cast_mut();
+
+                // SAFETY: Here we are guaranteeing that `grant_ptr` is not null. We can
+                // ensure this because we just created `grant_ptr` based on the
+                // process's allocated memory, and we know it cannot be null.
+                unsafe { Some(NonNull::new_unchecked(grant_ptr)) }
+            }
+        })
+    }
+
+    /// Create the identifier for a custom grant that grant.rs uses to access
+    /// the custom grant.
+    ///
+    /// We create this identifier by calculating the number of bytes between
+    /// where the custom grant starts and the end of the process memory.
+    fn create_custom_grant_identifier(&self, ptr: NonNull<u8>) -> ProcessCustomGrantIdentifier {
+        let custom_grant_address = ptr.as_ptr() as usize;
+        let process_memory_end = self.mem_end() as usize;
+
+        ProcessCustomGrantIdentifier {
+            offset: process_memory_end - custom_grant_address,
+        }
+    }
+
+    /// Use a `ProcessCustomGrantIdentifier` to find the address of the
+    /// custom grant.
+    ///
+    /// This reverses `create_custom_grant_identifier()`.
+    fn get_custom_grant_address(&self, identifier: ProcessCustomGrantIdentifier) -> usize {
+        let process_memory_end = self.mem_end() as usize;
+
+        // Subtract the offset in the identifier from the end of the process
+        // memory to get the address of the custom grant.
+        process_memory_end - identifier.offset
+    }
+
+    /// Return the app's read and modify storage permissions from the TBF header
+    /// if it exists.
+    ///
+    /// If the header does not exist then return `None`. If the header does
+    /// exist, this returns a 5-tuple with:
+    ///
+    /// - `write_allowed`: bool. If this process should have write permissions.
+    /// - `read_count`: usize. How many read IDs are valid.
+    /// - `read_ids`: [u32]. The read IDs.
+    /// - `modify_count`: usze. How many modify IDs are valid.
+    /// - `modify_ids`: [u32]. The modify IDs.
+    pub fn get_tbf_storage_permissions(&self) -> Option<(bool, usize, [u32; 8], usize, [u32; 8])> {
+        let read_perms = self.header.get_storage_read_ids();
+        let modify_perms = self.header.get_storage_modify_ids();
+
+        match (read_perms, modify_perms) {
+            (Some((read_count, read_ids)), Some((modify_count, modify_ids))) => Some((
+                self.header.get_storage_write_id().is_some(),
+                read_count,
+                read_ids,
+                modify_count,
+                modify_ids,
+            )),
+            _ => None,
+        }
+    }
+
+    /// The start address of allocated RAM for this process.
+    fn mem_start(&self) -> *const u8 {
+        self.memory_start
+    }
+
+    /// The first address after the end of the allocated RAM for this process.
+    fn mem_end(&self) -> *const u8 {
+        self.memory_start.wrapping_add(self.memory_len)
+    }
+
+    /// The start address of the flash region allocated for this process.
+    fn flash_start(&self) -> *const u8 {
+        self.flash.as_ptr()
+    }
+
+    /// Get the first address of process's flash that isn't protected by the
+    /// kernel. The protected range of flash contains the TBF header and
+    /// potentially other state the kernel is storing on behalf of the process,
+    /// and cannot be edited by the process.
+    fn flash_non_protected_start(&self) -> usize {
+        (self.flash.as_ptr() as usize) + self.header.get_protected_size() as usize
+    }
+
+    /// The first address after the end of the flash region allocated for this
+    /// process.
+    fn flash_end(&self) -> usize {
+        self.flash.as_ptr().addr().wrapping_add(self.flash.len())
+    }
+
+    /// The lowest address of the grant region for the process.
+    fn kernel_memory_break(&self) -> *const u8 {
+        self.kernel_memory_break.get()
+    }
+
+    /// Return the highest address the process has access to, or the current
+    /// process memory brk.
+    fn app_memory_break(&self) -> *const u8 {
+        self.app_break.get()
+    }
+}

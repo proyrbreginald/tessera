@@ -1,7 +1,8 @@
 # Tock 替换 RTIC：可行性验证记录
 
 > **状态：验证已通过（实验性），生产固件仍为 RTIC。**
-> 实验产物在仓库根 [`tock/`](../../tock/README.md)（板级 crate + 补丁 + 构建脚本）；
+> 源码已入仓：vendored Tock 在 [`runtime/tock/`](../../runtime/tock/README.md)
+> （裁剪后的上游源码 + 唯一本地板级 crate `boards/tessera-rt1021` + 补丁文件）；
 > 本文只记录**做了什么、结论是什么、还差什么**。
 
 ## 1. 背景
@@ -28,7 +29,17 @@ RTIC 的任务与中断绑定，并**完全沿用现有 Flash 布局与启动头
   ① RT1021 的 24 MHz 晶振下 OSR=16x/SBR=13；② `clear_overrun()` 用 W1C 正确清 `STAT.OR`。
 
 工具链：**stable rustc 1.99.1**（Tock 默认 nightly 配置中的 `-Z` 参数已替换为 stable
-兼容 flags）。完整构建/烧录步骤见 [`tock/README.md`](../../tock/README.md)。
+兼容 flags）。构建/烧录/验证统一用 `cargo xtask`（不用 make）：
+
+```bash
+cargo xtask tock-build     # 构建 runtime/tock 下的 Tock 镜像
+cargo xtask tock-flash     # 构建 + 全片擦除烧录
+cargo xtask tock-verify    # 构建 + 烧录 + 串口验证（启动横幅 + 行回显）
+cargo xtask tock-sync-boot-header  # 生产启动头变更后同步 boot_hdr.bin
+```
+
+目录分类与维护约定见 [`runtime/README.md`](../../runtime/README.md) 与
+[`runtime/tock/README.md`](../../runtime/tock/README.md)。
 
 ## 3. 结论（真机事实）
 
@@ -66,7 +77,7 @@ tock: rx line(11B): second-line
 ## 4. 与生产固件的关系
 
 - **生产固件不变**：`crates/firmware` 仍用 RTIC，`VERSION` 未递增（本次不改变交付行为）；
-- 实验镜像独立构建（`tock/build.sh`），烧录会覆盖板上的生产固件；
+- 实验镜像独立构建（`cargo xtask tock-build`），烧录会覆盖板上的生产固件；
   验证完用 `bash scripts/flash.sh -e chip` 恢复生产固件；
 - 两套入口共用同一份 Flash 分区与启动头，这是本次验证刻意保持的约束 ——
   它证明「换运行时不必换存储布局」，也说明后续迁移可以在同一分区模型下进行。
