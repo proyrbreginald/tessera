@@ -5,7 +5,7 @@ i.MX RT1021 / Cortex-M7 @396 MHz / 144-LQFP）上的**静态 capsule 化实时�
 **完全用 Rust 与其生态**实现，运行时用 **RTIC v2**，芯片支持用 NXP 官方的
 `imxrt-hal` / `imxrt-ral` / `imxrt-rt` / `imxrt-boot-gen`。
 
-> **当前版本：`0.1.0.0`**（新仓库起点）。工具链**永远跟随最新 stable Rust**，
+> **当前版本：`0.1.1.0`**。工具链**永远跟随最新 stable Rust**，
 > 不锁定具体 rustc 版本；可复现性由入库的 `Cargo.lock` 与 `xtask/Cargo.lock` 保证。
 
 > 底座**不含业务逻辑**：接入方在仓库之外建立自己的业务 capsule crate，通过 capsule SDK/
@@ -80,13 +80,13 @@ xtask              构建与产物门禁（主机专用，独立工作区，不�
 
 ```text
 主机测试        450 个用例全绿（18 个纯逻辑 crate 口径；含 7 个穷举掉电注入）
-目标构建        thumbv7em-none-eabihf release：text 44,228 B（ITCM 预算 65,536，余 21,308）
+目标构建        thumbv7em-none-eabihf release：text 44,792 B（ITCM 预算 65,536，余 20,744）
                 .xip 84,112 B / .stack 48 KiB
-Flash 映像      check-size：184,172 B / 上限 1,048,576 B（17.6%）
+Flash 映像      check-size：184,760 B / 上限 1,048,576 B（17.6%）
 产物级断言      FCB tag+版本+容量、LUT 三序列 4 字节地址相位、IVT 魔数、
                 向量表初始 SP=0x2000C000（DTCM 栈顶）、分区表与文档一致
 编译失败负例    1 个（`Cycles` 非零：record(span, 0) 必须编译不过）
-静态门禁        17 项子命令（分层 18 个纯逻辑 crate / 插件门禁 / lint 头 / unsafe 预算 81（实测 80）/
+静态门禁        18 项子命令（分层 18 个纯逻辑 crate / 插件门禁 / lint 头 / unsafe 预算 81（实测 80）/
                 风格 / 需求追溯 30/30 / 未实现项清点 3 项 / 产物断言 5 项）
 一键验证        `make verify` == `cargo xtask verify` 全绿
 目标端自检      `make test-target`：5 项（已恢复）（PIT 链 / MPU+cache / IVT 魔数 / 时基单调 / Flash 擦写回读）
@@ -98,7 +98,7 @@ Flash 映像      check-size：184,172 B / 上限 1,048,576 B（17.6%）
 PIT 64 位链式时基（漂移 +0.002%）、SDRAM 全片 32 MiB 自检、MPU + I/D cache、
 文件系统挂载与介质写入（擦除/页编程真机自证）、4 字节寻址自检、栈余量实测、
 非缓存 DMA 池自证。
-**2026-10-23**：`0.1.0.0`（新仓库起点：S1 组合根外提 + 工具链跟随 stable + 适配 1.99 clippy）已完成真机验证（`bytecheck` / `test-target` 5/5 / `bench --record` 全过：`rt=ok`、`txdrop=0`、栈余量 89%）。
+**2026-10-27**：`0.1.1.0`（中断/idle 的 R1–R5 优化；详见 `docs/02-架构/中断与idle轮询分析.md`）—— 真机 bytecheck / test-target 5/5 / bench --record 全过（rt=ok、txdrop=0、栈余量 89%）；上一节点 `0.1.0.0`（新仓库起点：S1 组合根外提 + 工具链跟随 stable + 适配 1.99 clippy）已完成真机验证（`bytecheck` / `test-target` 5/5 / `bench --record` 全过：`rt=ok`、`txdrop=0`、栈余量 89%）。
 **未通**：CAN 外部总线接收（内部 loopback 已 PASS）、Bootloader/run-backup、看门狗
 —— 见 `make gaps`。完整进展与规划见 [当前进展](docs/00-索引/当前进展.md)。
 

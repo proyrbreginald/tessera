@@ -10,7 +10,8 @@
 - 运行期复位/故障；
 - `txdrop` / `rxdrop` 非 0；
 - `rt=VIOLATION` 或 `rt=none`（跳过前 3 条预热样本）；
-- `dwt=DEAD` / `safe=1`；
+- `dwt=DEAD`；
+- （仅记录，不判失败）`covr=N`：维护步骤超 5 ms 预算的累计次数，见心跳行。
 - 时基漂移超过 ±2%；
 - 1 ms 节拍频率偏离 1000 Hz 超过 ±2%。
 
@@ -34,10 +35,13 @@ except ImportError:
     print("缺少 pyserial：make setup", file=sys.stderr)
     raise SystemExit(2)
 
+# 与固件 `report_beat` 的格式**逐字段对应**（2026-10-27 起带 `covr=`）。
+# 历史上这里曾残留 `safe=`/`rst=` 两个固件从未输出过的字段，导致长稳一个样本都
+# 匹配不到；字段增删必须同步本正则（这是一个没有门禁守护的跨语言契约）。
 BEAT = re.compile(
     r"beat=(\d+) uptime=(\d+)\.(\d{3})s tick=(\d+) wdg_ok=(\d) "
-    r"txdrop=(\d+) rxdrop=(\d+) safe=(\d) rst=(\d+) wfi=(\d+) "
-    r"dwt=(\w+) rearm=(\d+) fsq=(\d+)/(\d+)/(\d+)/(\d+) rt=(\w+)"
+    r"txdrop=(\d+) rxdrop=(\d+) wfi=(\d+) "
+    r"dwt=(\w+) rearm=(\d+) fsq=(\d+)/(\d+)/(\d+)/(\d+) rt=(\w+) covr=(\d+)"
 )
 DRIFT_TOLERANCE_PERCENT = 2.0
 TICK_RATE_TOLERANCE_PERCENT = 2.0
@@ -106,8 +110,6 @@ def main() -> int:
                     wdg_ok,
                     txdrop,
                     rxdrop,
-                    safe,
-                    rst,
                     wfi,
                     dwt,
                     rearm,
@@ -116,6 +118,7 @@ def main() -> int:
                     q_failed,
                     q_rejected,
                     rt,
+                    covr,
                 ) = match.groups()
                 samples.append(
                     {
@@ -125,8 +128,7 @@ def main() -> int:
                         "wdg_ok": int(wdg_ok),
                         "txdrop": int(txdrop),
                         "rxdrop": int(rxdrop),
-                        "safe": int(safe),
-                        "rst": int(rst),
+                        "covr": int(covr),
                         "dwt": dwt,
                         "rearm": int(rearm),
                         "fsq_failed": int(q_failed),
@@ -155,8 +157,7 @@ def main() -> int:
         problems.append("运行期出现 rt=VIOLATION/none")
     if any(s["dwt"] != "ok" for s in usable):
         problems.append("运行期出现 dwt=DEAD")
-    if any(s["safe"] for s in usable):
-        problems.append("运行期进入 Safe")
+    maintenance_overrun_total = sum(s["covr"] for s in usable)
     if any(s["wdg_ok"] == 0 for s in usable):
         problems.append("运行期 wdg_ok=0（健康位未到齐）")
     if any(s["fsq_failed"] or s["fsq_rejected"] for s in usable):
@@ -186,6 +187,7 @@ def main() -> int:
         "faults": faults,
         "txdrop_total": txdrop_total,
         "rxdrop_total": rxdrop_total,
+        "maintenance_overrun_total": maintenance_overrun_total,
         "drift_percent": drift,
         "tick_rate_hz": tick_rate,
         "problems": problems,

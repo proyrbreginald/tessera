@@ -36,7 +36,7 @@
 1. `cargo xtask verify` —— 建立基线。**必须全绿**再动任何代码；红了先修到绿。
 2. `cargo xtask context` —— 一次拿到：crate 划分、门禁清单、缺口（带 `文件:行`）、分区表、
    预算、基准基线、最近一次测试结果。**别去 grep 源码拼项目状态**。
-3. `cargo xtask gates` —— 17 项静态门禁的现状（不因第一个失败而中断）。
+3. `cargo xtask gates` —— 18 项静态门禁的现状（不因第一个失败而中断）。
 4. 读 [`docs/00-索引/项目地图.md`](docs/00-索引/项目地图.md)：启动链、存储地图、
    **怎么验证一件事**、缺口与里程碑。
 5. 要动某一层之前，先读该 crate 的 `lib.rs` 模块文档（每个都有，且写了「为什么」）。
@@ -70,6 +70,7 @@
 | `make` / `make help` | 列出全部目标 |
 | `cargo xtask check-layering` | 18 个纯逻辑 crate 的依赖闭包（含 `dev-dependencies`）里没有 `imxrt-*`/`cortex-m*`/`rtic` |
 | `cargo xtask check-capsules` | 插件门禁：`sdk` 保持纯逻辑；依赖了 `sdk` 的插件 crate **不得**直接依赖 `board-support`/`firmware`/`rtic`/`imxrt-*`。**只扫仓库内 `crates/`**（仓库外业务待 S3） |
+| `cargo xtask check-interrupt-priorities` | 中断任务优先级门禁：`#[task(binds = …, priority = N)]` 的**字面量**必须与期望表一致（RTIC 只接受字面量，编译器绑不到 `budget::prio`）；新增中断任务必须先登记 |
 | `cargo xtask check-lint-headers` | 每个纯逻辑 crate 的 `lib.rs` 带 `forbid(unsafe_code)` + 两条 clippy 拒绝项 |
 | `cargo xtask check-unsafe` | unsafe 块与 `// SAFETY:` 配平、`unsafe fn` 与 `# Safety` 配平，且不超预算 |
 | `cargo xtask check-fault-handlers` | 从**链接产物**断言四个故障向量（槽 3–6）各自指向真实实现或**刻意升级**：审计曾读到槽 3 是个 `b .` 空死循环、槽 4/5/6 共用默认桩 —— 那种缺陷编译得过、测试也全绿，只有看产物才发现 |

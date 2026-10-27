@@ -465,8 +465,14 @@ impl core::fmt::Write for Writer {
 // 现在的做法：RX 中断里只做"读一个字节 → 推入队列"，其余（回显、执行命令、
 // 格式化）全部留在 idle。TX 阻塞再久也不会丢输入。
 
-/// 接收环形队列深度。256 字节 ≈ 22 ms @115200，足够覆盖最长的阻塞输出。
-const RX_QUEUE: usize = 256;
+/// 接收环形队列深度。
+///
+/// 2026-10-27 从 256 B 提到 2048 B（≈178 ms @115200）。理由不是"越大越好"，
+/// 而是一个**实测下界**：idle 里单次 Flash 块擦除（64 KiB）实测约 60 ms，
+/// 而 FS 写路径无法把一次擦除再拆开；256 B（≈22 ms）覆盖不了它，维护期输入会丢
+/// （复现：`log rotate` 与 1,600 B 输入同窗，`rxdrop=511`）。
+/// 2 KiB 能覆盖"一次擦除"的最坏阻塞；再大没有证据支持，不做。
+const RX_QUEUE: usize = 2048;
 
 static RX: Mutex<RefCell<heapless::Deque<u8, RX_QUEUE>>> =
     Mutex::new(RefCell::new(heapless::Deque::new()));

@@ -46,6 +46,28 @@ static HIGH_JOB: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::ne
 static CANCEL_REQUESTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// 维护服务当前是否有**活动作业**。
+///
+/// 自动轮转（`RotateService`）用它与队列状态一起判断"不要重复投递轮转"：
+/// 没有这个标志时，活动文件在轮转完成前一直超阈值，会每秒重复投递一次作业。
+static MAINTENANCE_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// 维护 step 超预算的累计次数（只增；心跳以每秒增量上报）。
+static MAINTENANCE_OVERRUNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// 维护队列或活动作业是否非空（自动轮转的"别重复投递"判据）。
+pub(crate) fn maintenance_busy() -> bool {
+    let queued = PENDING_JOBS.load(core::sync::atomic::Ordering::Relaxed) >> 24 != 0
+        || HIGH_JOB.load(core::sync::atomic::Ordering::Relaxed) != 0;
+    queued || MAINTENANCE_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 取走并清零维护超预算次数（心跳 `covr=` 用，与 `txdrop=` 同口径）。
+pub(crate) fn take_maintenance_overruns() -> u32 {
+    MAINTENANCE_OVERRUNS.swap(0, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// 请求取消当前维护作业。
 pub(crate) fn request_cancel() -> bool {
     CANCEL_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
@@ -143,7 +165,6 @@ enum ActiveJob {
 pub(crate) struct MaintenanceService {
     active: Option<ActiveJob>,
     started_us: u64,
-    overruns: u32,
 }
 
 impl MaintenanceService {
@@ -152,7 +173,6 @@ impl MaintenanceService {
         Self {
             active: None,
             started_us: 0,
-            overruns: 0,
         }
     }
 }
@@ -173,13 +193,16 @@ impl Capsule<TerminalStepContext> for MaintenanceService {
     fn step(&mut self, _ctx: &mut TerminalStepContext) -> CapsuleStep {
         let start = board_support::timer::PitClock.now().as_micros();
         let outcome = self.step_inner(_ctx);
+        // 让外部（自动轮转投递）看到"有没有活动作业"。
+        MAINTENANCE_ACTIVE.store(self.active.is_some(), core::sync::atomic::Ordering::Relaxed);
         if outcome.worked() {
             let elapsed = board_support::timer::PitClock
                 .now()
                 .as_micros()
                 .saturating_sub(start);
             if elapsed > MAINTENANCE_STEP_BUDGET_US {
-                self.overruns = self.overruns.saturating_add(1);
+                // 超预算必须可观测：心跳以 `covr=` 上报每秒增量（R5）。
+                MAINTENANCE_OVERRUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return CapsuleStep::Deferred;
             }
         }
@@ -483,11 +506,15 @@ impl Capsule<TerminalStepContext> for FsService {
             self.last_gc_tick = tick;
             let _ = board_support::fs::with_fs_owner(|fs| fs.gc());
         }
-        match board_support::fs::step() {
+        // 每轮最多执行 1 条请求（R3）：把"一次排空 8 条"拆成多轮，
+        // 让终端输入/健康相位在两轮之间得到执行机会。剩余请求返回 `Partial`，
+        // 按 `Worked` 处理（不睡眠，下一轮继续）。
+        match board_support::fs::step_at_most(1) {
             board_support::fs::StepOutcome::Idle | board_support::fs::StepOutcome::Unavailable => {
                 CapsuleStep::Idle
             }
-            board_support::fs::StepOutcome::Drained { ok } => {
+            board_support::fs::StepOutcome::Drained { ok }
+            | board_support::fs::StepOutcome::Partial { ok } => {
                 if ok > 0 {
                     CapsuleStep::Worked
                 } else {
@@ -558,8 +585,23 @@ impl Capsule<TerminalStepContext> for LogService {
     }
 }
 
-/// 活动日志轮转。
-pub(crate) struct RotateService;
+/// 自动轮转的检查间隔（R4）：不再每轮都查文件大小，最多每秒一次。
+const LOG_ROTATE_CHECK_INTERVAL_US: u64 = 1_000_000;
+
+/// 活动日志轮转（自动检查）。
+///
+/// 只负责"到点、超阈值、没有正在跑的轮转"时**投递维护作业**；真正的分片归档由
+/// `MaintenanceService` 执行，与手动 `log rotate` 走同一条路径（R4）。
+pub(crate) struct RotateService {
+    last_check_us: u64,
+}
+
+impl RotateService {
+    /// 新建自动轮转检查器。
+    pub(crate) const fn new() -> Self {
+        Self { last_check_us: 0 }
+    }
+}
 
 impl Capsule<TerminalStepContext> for RotateService {
     fn name(&self) -> &'static str {
@@ -574,7 +616,31 @@ impl Capsule<TerminalStepContext> for RotateService {
     }
 
     fn step(&mut self, _ctx: &mut TerminalStepContext) -> CapsuleStep {
-        if crate::rotate_log_if_needed() {
+        let now_us = board_support::timer::PitClock.now().as_micros();
+        // 1) 检查降频：最多每秒一次（避免每轮一次 FS 元数据查询）。
+        if now_us.saturating_sub(self.last_check_us) < LOG_ROTATE_CHECK_INTERVAL_US {
+            return CapsuleStep::Idle;
+        }
+        self.last_check_us = now_us;
+        // 2) 启动/自检窗口内不自动切分；等系统稳定后再做。
+        if now_us / 1000 < crate::LOG_ROTATE_AFTER_MS {
+            return CapsuleStep::Idle;
+        }
+        // 3) 已有轮转作业在排队/执行时不要重复投递。
+        if maintenance_busy() {
+            return CapsuleStep::Idle;
+        }
+        // 4) 只在**写队列空闲**时投递：归档与"日志正在落盘"并发时，真机出现过
+        //    写失败并把空闲块耗尽（2026-10-27 实验）。宁可晚一轮，等日志先落完。
+        if board_support::fs::queue_stats().pending > 0 {
+            return CapsuleStep::Idle;
+        }
+        // 5) 只有活动文件真的超阈值才投递。
+        let active = crate::archive_file_size(board_support::config::files::BLACKBOX);
+        if active < crate::LOG_ROTATE_BYTES {
+            return CapsuleStep::Idle;
+        }
+        if request_maintenance(MaintenanceJob::LogRotate) {
             CapsuleStep::Worked
         } else {
             CapsuleStep::Idle

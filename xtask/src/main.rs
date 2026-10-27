@@ -2080,6 +2080,7 @@ fn main() {
     let result = match command {
         "check-layering" => check_layering(),
         "check-capsules" => check_capsules(),
+        "check-interrupt-priorities" => check_interrupt_priorities(),
         "check-lint-headers" => check_lint_headers(),
         "check-unsafe" => check_unsafe(),
         "check-gaps" => check_gaps(),
@@ -2147,6 +2148,11 @@ const COMMANDS: &[Subcommand] = &[
         name: "check-capsules",
         what: "capsule 插件只依赖 sdk/端口层，不碰硬件/组合根",
         check: Some(check_capsules),
+    },
+    Subcommand {
+        name: "check-interrupt-priorities",
+        what: "中断任务优先级与预算表一致（RTIC 字面量无法被编译器绑定）",
+        check: Some(check_interrupt_priorities),
     },
     Subcommand {
         name: "check-lint-headers",
@@ -2555,6 +2561,109 @@ fn check_capsules() -> Result<(), String> {
     }
     println!("[xtask] check-capsules 通过：sdk 纯逻辑，且没有插件直接依赖硬件/组合根");
     Ok(())
+}
+
+// ---------------------------------------------------------------- 中断优先级
+
+/// 已落地的硬件中断任务及其**期望的 RTIC 优先级**。
+///
+/// R1：RTIC 的 `priority = N` 只接受整数字面量，编译器无法把它与
+/// `primitives::budget::prio` 绑定；本门禁把这条接线变成**可失败判据**：
+/// - 新增中断任务必须登记在这里（否则报"未登记的中断任务"）；
+/// - 已登记任务的优先级字面量变了必须同步改这里与文档。
+///
+/// `console_rx`（`LPUART1`）与 `deadline_tick`（`PIT`）**同为 1** 是刻意的：
+/// 两者互不抢占，相对字节间隔/时基周期分别有 4×/50× 余量。
+/// `budget::prio::SERIAL_RX=2` 属于**尚未落地**的串行总线任务，不是 `console_rx`
+/// （见 `docs/02-架构/中断与idle轮询分析.md` §3）。
+const EXPECTED_TASK_PRIORITIES: &[(&str, u8)] = &[("LPUART1", 1), ("PIT", 1)];
+
+/// 中断任务优先级门禁。
+fn check_interrupt_priorities() -> Result<(), String> {
+    let root = workspace_root();
+    let main_source = read(&root.join("crates/firmware/src/main.rs"))?;
+    let budget = read(&root.join("crates/primitives/src/budget.rs"))?;
+    let deadline_tick = parse_u8_const(&budget, "DEADLINE_TICK")
+        .ok_or("budget.rs 里解析不到 `pub const DEADLINE_TICK: u8`")?;
+
+    let mut found: Vec<(String, u8)> = Vec::new();
+    for line in main_source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("#[task(") {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("#[task(binds = ") else {
+            return Err(format!("无法解析任务属性：{trimmed}"));
+        };
+        let Some((bind, tail)) = rest.split_once(',') else {
+            return Err(format!("任务属性缺 `binds` 后的逗号：{trimmed}"));
+        };
+        let Some(rest) = tail.trim_start().strip_prefix("priority = ") else {
+            return Err(format!("任务 {bind} 缺 `priority =`：{trimmed}"));
+        };
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let priority: u8 = digits
+            .parse()
+            .map_err(|_| format!("任务 {bind} 的 priority 不是数字：{trimmed}"))?;
+        found.push((bind.trim().to_string(), priority));
+    }
+    if found.is_empty() {
+        return Err(
+            "main.rs 里一个 `#[task(binds = ...)]` 都解析不到（代码结构或解析器变了）".to_string(),
+        );
+    }
+
+    for (bind, expected) in EXPECTED_TASK_PRIORITIES {
+        let actual = found
+            .iter()
+            .find(|(name, _)| name == bind)
+            .map(|(_, priority)| *priority)
+            .ok_or_else(|| format!("已登记的中断任务 {bind} 没有出现在 main.rs 里"))?;
+        // PIT 的期望值直接取预算表的 `DEADLINE_TICK`（改预算表会逼这里一起改）。
+        let expected_value = if *bind == "PIT" {
+            deadline_tick
+        } else {
+            *expected
+        };
+        if actual != expected_value {
+            return Err(format!(
+                "任务 {bind} 的 priority={actual}，期望 {expected_value}（改优先级必须同时改本门禁、budget 与文档）"
+            ));
+        }
+    }
+    for (name, _) in &found {
+        if !EXPECTED_TASK_PRIORITIES
+            .iter()
+            .any(|(expected, _)| expected == name)
+        {
+            return Err(format!(
+                "发现未登记的中断任务 {name}：新增任务必须同时登记本门禁与 docs/02-架构/中断与idle轮询分析.md"
+            ));
+        }
+    }
+    println!(
+        "[xtask] check-interrupt-priorities 通过：LPUART1=1、PIT={deadline_tick}（budget::DEADLINE_TICK），无未登记中断任务"
+    );
+    Ok(())
+}
+
+/// 从源码里解析 `pub const NAME: u8 = N;`（只用于预算表数字，不做通用 Rust 解析）。
+fn parse_u8_const(source: &str, name: &str) -> Option<u8> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(name) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(": u8 = ") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        return digits.parse().ok();
+    }
+    None
 }
 
 fn check_lint_headers() -> Result<(), String> {
@@ -3664,6 +3773,7 @@ fn verify() -> Result<(), String> {
     println!("== 静态门禁 ==");
     check_layering()?;
     check_capsules()?;
+    check_interrupt_priorities()?;
     check_lint_headers()?;
     check_unsafe()?;
     check_gaps()?;

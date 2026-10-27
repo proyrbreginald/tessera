@@ -321,6 +321,9 @@ static GZIP_STACK_PEAK_BYTES: AtomicU32 = AtomicU32::new(0);
 static GZIP_STATE: Mutex<RefCell<Option<alloc::boxed::Box<gzip::CompressorOxide>>>> =
     Mutex::new(RefCell::new(None));
 
+/// 压缩器状态是否已初始化（R2：初始化必须在关中断窗口之外完成）。
+static GZIP_STATE_READY: AtomicBool = AtomicBool::new(false);
+
 /// 压缩前把整段 SDRAM 栈涂成指纹，用于测峰值并检查底部 canary。
 #[inline(never)]
 #[unsafe(link_section = ".xip")]
@@ -421,10 +424,22 @@ unsafe extern "C" fn gzip_compress_job(arg: *mut ()) -> u32 {
 #[inline(never)]
 #[unsafe(link_section = ".xip")]
 fn gzip_on_sdram_stack(input: &[u8], output: &mut [u8]) -> Option<usize> {
+    // R2：压缩器状态很大（约 320 KiB），`new_compressor()` 的初始化在真机上实测
+    // 约 2.9 ms。它曾经整个发生在 `measured_cs` 里 —— 也就是**关中断 2.9 ms**，
+    // 远超 80 µs 预算（2026-10-23 真机：irq-off 2,886 µs，且只在第一次归档出现）。
+    // 现在把重活放在临界区**之外**，临界区里只做"发布指针"。
+    let candidate = if GZIP_STATE_READY.load(Ordering::Acquire) {
+        None
+    } else {
+        Some(alloc::boxed::Box::new(gzip::new_compressor()))
+    };
     let state: *mut gzip::CompressorOxide = board_support::rt::measured_cs(|cs| {
         let mut guard = GZIP_STATE.borrow(cs).borrow_mut();
-        if guard.is_none() {
-            *guard = Some(alloc::boxed::Box::new(gzip::new_compressor()));
+        if guard.is_none()
+            && let Some(compressor) = candidate
+        {
+            *guard = Some(compressor);
+            GZIP_STATE_READY.store(true, Ordering::Release);
         }
         guard.as_mut().map_or(core::ptr::null_mut(), |state| {
             &mut **state as *mut gzip::CompressorOxide
@@ -1464,7 +1479,7 @@ mod app {
 
         let mut fs_service = capsules::FsService::new();
         let mut log_service = capsules::LogService;
-        let mut rotate_service = capsules::RotateService;
+        let mut rotate_service = capsules::RotateService::new();
         let mut health_service = capsules::HealthService;
         let mut maintenance_service = capsules::MaintenanceService::new();
         // 产品组合根在独立 crate `product`：它决定 capsule 集合与注册顺序，
@@ -3268,7 +3283,10 @@ pub(crate) struct RotateState {
 }
 
 /// 分片轮转的单块大小。
-const LOG_ROTATE_CHUNK: usize = 2048;
+///
+/// R3：从 2 KiB 降到 512 B。单块成本 ≈ 读 + DEFLATE + 归档写入；
+/// 2 KiB 时真机单步到 22~68 ms（远超 1 ms 的 `idle-step` 预算），切细后更容易有界。
+const LOG_ROTATE_CHUNK: usize = 512;
 
 /// 开始一次分片日志轮转：确保索引可用，返回 generation 与初始进度。
 pub(crate) fn rotate_start() -> Option<RotateState> {
@@ -3333,6 +3351,12 @@ pub(crate) fn rotate_step(state: &mut RotateState) -> Result<bool, ()> {
             rotate_abort(state);
             return Err(());
         }
+        // ⚠️ 每一笔归档写都必须**提交后立即推进**，不能攒批后交给 FsService：
+        // 2026-10-27 真机 A/B 证明，把"提交-执行"拆开会让 FS 在多笔归档写同时
+        // 排队时失败，并逐步把空闲块耗尽（一次 rotate 后 441 → 0，FS 被写满）；
+        // 旧版（逐笔提交后立即执行）在同样输入突发下成功且空闲块不变。
+        // 因此 R3 的"每步 1 条"只用于常驻日志队列；归档路径保持**逐笔同步**。
+        // 分片仍从 2 KiB 降到 512 B（单步工作量更小）。
         let _ = board_support::fs::step();
         at = end;
     }
@@ -3354,6 +3378,11 @@ pub(crate) fn rotate_step(state: &mut RotateState) -> Result<bool, ()> {
 }
 
 fn rotate_finish(state: &mut RotateState) -> Result<bool, ()> {
+    // R3：归档字节还在写队列里时不能校验大小/写索引（会读到旧大小而误判失败）。
+    // 本轮先让路，由 FsService 排空后再继续。
+    if board_support::fs::queue_stats().pending > 0 {
+        return Ok(false);
+    }
     if state.source_bytes == 0 || state.gzip_bytes == 0 {
         rotate_abort(state);
         return Err(());
@@ -3405,35 +3434,6 @@ fn rotate_abort(state: &RotateState) {
         let _ = board_support::fs::submit(board_support::fs::WriteKind::Remove, path, &[]);
         let _ = board_support::fs::step();
     }
-}
-
-/// 活动日志超阈值时：新建 generation 归档，成功后再清空活动文件。
-///
-/// 不再复制任何旧窗口；旧窗口的删除由 `archive_store_bytes` 在索引更新后完成。
-/// 失败时保留活动文件，宁可重复也不丢数据。
-#[inline(never)]
-#[unsafe(link_section = ".xip")]
-fn rotate_log_if_needed() -> bool {
-    // 启动/自检窗口内不自动切分；等系统稳定 30 s 后再做。
-    let uptime_ms = board_support::timer::PitClock.now().as_micros() / 1000;
-    if uptime_ms < LOG_ROTATE_AFTER_MS {
-        return false;
-    }
-    let _ = log_try_flush(true);
-    let active = archive_file_size(board_support::config::files::BLACKBOX);
-    if active < LOG_ROTATE_BYTES {
-        return false;
-    }
-    let Some(_window) = archive_archive_file(board_support::config::files::BLACKBOX) else {
-        return false;
-    };
-    let _ = board_support::fs::submit(
-        board_support::fs::WriteKind::Write,
-        board_support::config::files::BLACKBOX,
-        b"\n[rotated]\n",
-    );
-    let _ = board_support::fs::step();
-    true
 }
 
 /// selftest 的 Flash 擦/写/回读段（Flash 擦写路径保持 ITCM）。
@@ -3902,6 +3902,8 @@ struct Beat {
     dwt_alive: bool,
     /// 文件系统写队列的统计快照（待处理/成功/失败/被拒）。
     fs_queue: board_support::fs::QueueStats,
+    /// 自上次心跳以来维护步骤超 5 ms 预算的次数（R5；只涨的计数器按秒取增量）。
+    maintenance_overruns: u32,
 }
 
 #[inline(never)]
@@ -3930,7 +3932,7 @@ fn report_beat(beat: &Beat) {
     // 说明有人试图在关中断上下文里输出超过队列容量的数据 —— 那是真实的故障前兆
     // （启动期最危险：审计实测 `#[init]` 要输出 1,117 B，而队列只有 2,048 B）。
     console::write_fmt_line(format_args!(
-        "beat={} uptime={}.{:03}s tick={} wdg_ok={} txdrop={} rxdrop={} wfi={} dwt={} rearm={} fsq={}/{}/{}/{} rt={}",
+        "beat={} uptime={}.{:03}s tick={} wdg_ok={} txdrop={} rxdrop={} wfi={} dwt={} rearm={} fsq={}/{}/{}/{} rt={} covr={}",
         beat.beats,
         beat.now.as_micros() / 1_000_000,
         (beat.now.as_micros() / 1_000) % 1_000,
@@ -3950,7 +3952,10 @@ fn report_beat(beat: &Beat) {
         beat.fs_queue.executed,
         beat.fs_queue.failed,
         beat.fs_queue.rejected,
-        rt_verdict
+        rt_verdict,
+        // `covr=`：自上次心跳以来**维护步骤超 5 ms 预算**的次数（R5）。
+        // `idle-step` 回答"一整轮慢不慢"，`covr=` 回答"维护慢不慢"。
+        beat.maintenance_overruns
     ));
 }
 
@@ -4484,6 +4489,7 @@ fn current_beat(clock: &board_support::timer::PitClock) -> Beat {
         wfis: take_wfis(),
         dwt_rearms: DWT_REARMS.load(Ordering::Relaxed),
         fs_queue: board_support::fs::queue_stats(),
+        maintenance_overruns: capsules::take_maintenance_overruns(),
         dwt_alive: board_support::rt::is_installed(),
     }
 }

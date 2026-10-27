@@ -400,6 +400,16 @@ pub fn submit(kind: WriteKind, name: &str, data: &[u8]) -> bool {
 pub enum StepOutcome {
     /// 空。
     Idle,
+    /// 达到单步上限后停下，**队列仍有剩余**（下一轮继续）。
+    ///
+    /// 为什么需要这一态：idle 是协作式循环，如果 `step()` 一次排空 8 个请求，
+    /// 单个请求又可能触发 Flash 擦写，那么"一轮"会到几十毫秒（真机实测 68 ms）——
+    /// 期间 RX 队列（现为 2 KiB ≈ 178 ms）会满，终端输入被丢。
+    /// 有界推进把长活拆到多轮：每轮最多 `max_requests` 条，剩余留给下一轮。
+    Partial {
+        /// 本轮成功条数。
+        ok: usize,
+    },
     /// 全部成功。
     Drained {
         /// 成功条数。
@@ -416,8 +426,20 @@ pub enum StepOutcome {
     Unavailable,
 }
 
-/// 属主推进一步。
+/// 属主推进一步（**不限条数**：把队列一次排空）。
+///
+/// 终端显式命令、归档/轮转这类"同步完成再校验"的路径用它；
+/// idle 的常驻推进请用 [`step_at_most`]，避免单轮过长。
 pub fn step() -> StepOutcome {
+    step_at_most(usize::MAX)
+}
+
+/// 属主推进**至多 `max_requests` 条**请求；返回后队列可能仍有剩余。
+///
+/// 这是 idle 单步上限的实现点：每轮只做有限条，`Partial` 明确告诉调用方"还没做完"。
+/// 注意单条请求本身仍可能擦 Flash（几十毫秒量级），所以"条数上限"不等于"时间上限"；
+/// 真正的单步上界还要靠减少每条请求的代价（分片、批处理策略）来保证。
+pub fn step_at_most(max_requests: usize) -> StepOutcome {
     let pending = crate::rt::measured_cs(|cs| QUEUE.borrow(cs).borrow().pending());
     if pending == 0 {
         return StepOutcome::Idle;
@@ -425,13 +447,15 @@ pub fn step() -> StepOutcome {
     let mut ok = 0usize;
     let mut failed = 0usize;
     let Some(()) = with_fs_owner(|fs| {
-        loop {
+        let mut processed = 0usize;
+        while processed < max_requests {
             let request = crate::rt::measured_cs(|cs| QUEUE.borrow(cs).borrow_mut().take());
             let Some(request) = request else {
-                break;
+                return;
             };
             let succeeded = execute(fs, &request);
             crate::rt::measured_cs(|cs| QUEUE.borrow(cs).borrow_mut().complete(succeeded));
+            processed = processed.saturating_add(1);
             if succeeded {
                 ok = ok.saturating_add(1);
             } else {
@@ -441,10 +465,16 @@ pub fn step() -> StepOutcome {
     }) else {
         return StepOutcome::Unavailable;
     };
-    if failed == 0 {
-        StepOutcome::Drained { ok }
+    if failed > 0 {
+        return StepOutcome::DrainedWithFailures { ok, failed };
+    }
+    // 循环结束可能是因为"队空"，也可能是因为"到达上限"。用一次真实的 pending 读区分，
+    // 而不是根据计数器推断 —— 否则恰好装满上限时会误报 Partial。
+    let remaining = crate::rt::measured_cs(|cs| QUEUE.borrow(cs).borrow().pending());
+    if remaining > 0 {
+        StepOutcome::Partial { ok }
     } else {
-        StepOutcome::DrainedWithFailures { ok, failed }
+        StepOutcome::Drained { ok }
     }
 }
 
