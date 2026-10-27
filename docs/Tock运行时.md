@@ -46,6 +46,6 @@ tock: rx line(11B): TOCK-VERIFY
 RX/TX 队列 → capsule/进程迁移 → 时基/调度语义 → BSP 迁移 → 重新建立等价门禁
 （`cargo xtask verify` + 真机 `bytecheck`/`test-target`）后，才谈切换 `crates/firmware`。
 
-维护约定与升级步骤见 [`tock/README.md`](../tock/README.md)、
+迁移计划见 [Tock 迁移计划](Tock迁移计划.md)；维护约定与升级步骤见 [`tock/README.md`](../tock/README.md)、
 [`tock/README.md`](../tock/README.md)、
 [`tock/LOCAL_PATCHES.md`](../tock/LOCAL_PATCHES.md)。
