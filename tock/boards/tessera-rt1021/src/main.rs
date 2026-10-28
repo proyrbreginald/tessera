@@ -18,7 +18,7 @@ use kernel::process::StoppedExecutingReason;
 use kernel::scheduler::{Scheduler, SchedulingDecision};
 use kernel::static_init;
 
-use board_support::{console, timer};
+use board_support::{console, mpu, timer};
 use ports::clock::Clock;
 
 pub mod boot_header;
@@ -44,6 +44,10 @@ static TICK: timer::TickSource = timer::TickSource::new();
 
 /// 自本次启动以来的 1 ms 心跳计数（ISR 只做这一个原子加）。
 static TICKS: AtomicU32 = AtomicU32::new(0);
+/// 未预期中断计数（只计数，不 panic）。
+static UNEXPECTED_IRQS: AtomicU32 = AtomicU32::new(0);
+/// 内核 loop 是否已启动（panic 策略用）。
+pub static BOOTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// LPUART1/PIT 的中断分发：把 Tock 的 `InterruptService` 桥接到 BSP。
 struct BspInterrupts;
@@ -56,12 +60,19 @@ impl InterruptService for BspInterrupts {
                 true
             }
             PIT_IRQ => {
-                // 中断第一件事必须是清标志，否则会立刻重入。
-                TICK.clear();
-                TICKS.fetch_add(1, Ordering::Relaxed);
+                // Tock 会对同一 PIT 事件重复分发一次（电平中断 + 重新 enable）。
+                // 先读后清：只有真到期才计数，伪进入直接忽略（不 panic、不误报）。
+                if TICK.is_elapsed() {
+                    TICK.clear();
+                    TICKS.fetch_add(1, Ordering::Relaxed);
+                }
                 true
             }
-            _ => false,
+            _ => {
+                // Boot ROM/未接线外设可能留下 pending 中断：清掉并计数，不 panic。
+                UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
+                true
+            }
         }
     }
 }
@@ -99,6 +110,109 @@ static mut LINE_LEN: usize = 0;
 /// 每秒心跳的基准（uptime 微秒）。
 static mut LAST_BEAT_US: u64 = 0;
 
+/// Tock 栈边界（链接脚本符号）。
+fn stack_bounds() -> (usize, usize) {
+    // SAFETY: 链接脚本符号；只取地址。
+    unsafe extern "C" {
+        static _sstack: u32;
+        static _estack: u32;
+    }
+    (
+        core::ptr::addr_of!(_sstack) as usize,
+        core::ptr::addr_of!(_estack) as usize,
+    )
+}
+
+/// 读当前 SP。
+fn current_sp() -> usize {
+    let sp: usize;
+    // SAFETY: 只读 SP。
+    unsafe {
+        core::arch::asm!("mov {sp}, sp", sp = out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
+/// 启动时把 SP 以下的空闲栈涂指纹，之后用高水位报告栈余量。
+fn paint_stack() {
+    const PAINT: u32 = 0xA5A5_A5A5;
+    let (bottom, _top) = stack_bounds();
+    let upper = current_sp().saturating_sub(64) & !3;
+    if upper <= bottom {
+        return;
+    }
+    let words = (upper - bottom) / 4;
+    // SAFETY: 区间在 Tock 栈内、当前 SP 之下；启动期中断已关。
+    unsafe {
+        let stack = core::slice::from_raw_parts_mut(
+            core::ptr::with_exposed_provenance_mut::<u32>(bottom),
+            words,
+        );
+        for word in stack {
+            *word = PAINT;
+        }
+    }
+}
+
+/// 栈高水位（已用字节, 总字节）。
+fn stack_usage() -> (usize, usize) {
+    const PAINT: u32 = 0xA5A5_A5A5;
+    let (_bottom, top) = stack_bounds();
+    let total = top.saturating_sub(bottom);
+    let words = total / 4;
+    // SAFETY: 区间属于 Tock 栈；只读。
+    let stack = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::with_exposed_provenance::<u32>(bottom),
+            words,
+        )
+    };
+    let mut painted = 0;
+    for &word in stack {
+        if word == PAINT {
+            painted += 1;
+        } else {
+            break;
+        }
+    }
+    (total.saturating_sub(painted * 4), total)
+}
+
+/// 启动自检：FCB/IVT、向量表初始 SP、MPU/cache；结果写成证据行。
+fn print_boot_checks() {
+    // SAFETY: 启动头在 Flash 映射内；只读 4 字节对齐字。
+    let (fcb, ivt_magic, ivt_entry) = unsafe {
+        (
+            core::ptr::read_volatile(0x6000_0000u32 as *const u32),
+            core::ptr::read_volatile(0x6000_1000u32 as *const u32),
+            core::ptr::read_volatile(0x6000_1004u32 as *const u32),
+        )
+    };
+    let header_ok = fcb == u32::from_le_bytes(*b"FCFB")
+        && ivt_magic == 0x4020_00D1
+        && ivt_entry == 0x6000_2000;
+    let (_bottom, top) = stack_bounds();
+    // SAFETY: 向量表首字在 Flash；只读。
+    let vector_sp = unsafe { core::ptr::read_volatile(0x6000_2000u32 as *const u32) } as usize;
+    let vector_ok = vector_sp == top;
+    let (icache, dcache, mpu_on) = mpu::state();
+    let (used, total) = stack_usage();
+    console::write_fmt_line(format_args!(
+        "tock: selfcheck header={} vector={} stack={}KiB used={}B",
+        if header_ok { "PASS" } else { "FAIL" },
+        if vector_ok { "PASS" } else { "FAIL" },
+        total / 1024,
+        used
+    ));
+    console::write_fmt_line(format_args!(
+        "tock: selfcheck mpu={} icache={} dcache={} regions={}",
+        if mpu_on { "ON" } else { "OFF" },
+        if icache { "ON" } else { "OFF" },
+        if dcache { "ON" } else { "OFF" },
+        mpu::region_count()
+    ));
+}
+
 /// 内核 loop 的协作工作：1 Hz 心跳 + 消费 BSP 的 RX 队列（按行回显）。
 fn phase1_work() {
     // 心跳：uptime 取 BSP 的 64 位 PIT 时基，monitor 判据可直接用。
@@ -108,13 +222,17 @@ fn phase1_work() {
         if now_us.saturating_sub(LAST_BEAT_US) >= 1_000_000 {
             LAST_BEAT_US = now_us;
             let ticks = TICKS.load(Ordering::Relaxed);
+            let (used, total) = stack_usage();
+            let headroom = if total == 0 { 0 } else { (total - used) * 100 / total };
             console::write_fmt_line(format_args!(
-                "tock: beat uptime={}.{:03}s ticks={} txdrop={} rxdrop={}",
+                "tock: beat uptime={}.{:03}s ticks={} txdrop={} rxdrop={} irq_bad={} stack={}%",
                 now_us / 1_000_000,
                 (now_us % 1_000_000) / 1_000,
                 ticks,
                 console::take_dropped_bytes(),
                 console::take_rx_dropped(),
+                UNEXPECTED_IRQS.load(Ordering::Relaxed),
+                headroom,
             ));
         }
     }
@@ -233,10 +351,15 @@ pub unsafe fn main() {
         core::ptr::write_bytes(start, 0, end.offset_from(start) as usize);
     }
 
-    // 4. BSP 初始化：控制台 + PIT + SDRAM + FlexSPI LUT。
+    // 4. MPU + I/D cache：Flash 只读、OCRAM 可缓存（必须在 BSP 大内存访问之前）。
+    mpu::init();
+    // 5. 栈涂抹：之后心跳报告高水位。
+    paint_stack();
+
+    // 6. BSP 初始化：控制台 + PIT + SDRAM + FlexSPI LUT。
     let board = board_support::board::init(BANNER, VERSION.trim());
 
-    // 5. 启动 1 ms 心跳并重新打开需要的中断线。
+    // 7. 启动 1 ms 心跳并重新打开需要的中断线。
     board.clock.start_tick();
     cortexm7::nvic::Nvic::new(imxrt10xx::nvic::LPUART1).enable();
     cortexm7::nvic::Nvic::new(PIT_IRQ).enable();
@@ -245,7 +368,8 @@ pub unsafe fn main() {
         core::arch::asm!("cpsie i");
     }
 
-    // 6. Phase 1 证明行（保持与最小验证版一致的判据前缀）。
+    // 8. 启动自检证据行 + Phase 1 证明行。
+    print_boot_checks();
     console::write_line("tock: tessera-rt1021 kernel boot");
     console::write_line("tock: kernel_loop running (echo mode)");
 
@@ -262,6 +386,7 @@ pub unsafe fn main() {
         systick: cortexm7::systick::SysTick::new_with_calibration(396_000_000),
     };
 
+    BOOTED.store(true, Ordering::Release);
     board_kernel.kernel_loop(
         &platform,
         chip,

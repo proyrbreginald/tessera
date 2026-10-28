@@ -27,6 +27,14 @@ RTIC 依赖面很小：工作区 `rtic`、`firmware/Cargo.toml`、`firmware/src/
 - `cargo xtask monitor`：心跳 `tock: beat uptime=…` 正常，时基漂移 ±0.03%（容差 ±2%）。
 
 > 本阶段仍未迁移终端/FS/日志命令（属阶段 3）；`bytecheck` 全量通过是阶段 1 之后的判据。
+> **加固（2026-10-28，已真机实测）**：启动期先关 CPU 中断 → Tock 向量表/NVIC →
+> 清 BSP `.dtcm` → 涂栈 → MPU + I/D cache → BSP 初始化 → 设置 LPUART1/PIT 优先级(1) 并使能；
+> 启动自检 FCB/IVT/向量表 SP/栈边界/MPU/cache（失败即停）；栈涂抹高水位（启动 used=368 B，
+> 余量 98%）；panic 在启动完成后自动复位；未预期中断计数 `irq_bad`（不 panic）。
+> 实测：`tock-verify` 通过 + 8 s 稳定性观察（8 条心跳、无 RX 错误）；心跳 `ticks` 1000/s、
+> `irq_bad=0`、`txdrop=0`、`rxdrop=0`；`monitor` 时基漂移 ±0.03%。
+> 残余：Tock 对 PIT 同一事件每周期多分发一次（已按 `TIF` 真伪过滤，ISR 开销约 2×，
+> 留到阶段 2 从芯片分发层处理）；看门狗未启用（P5）。
 
 **目标**：Tock 入口调用现有 `board_support::init()`，串口终端可用、心跳可见；
 生产固件仍为 RTIC（双轨，可回退）。

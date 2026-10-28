@@ -3884,7 +3884,100 @@ fn tock_build() -> Result<(), String> {
     if !elf.is_file() {
         return Err(format!("构建结束但找不到 ELF：{}", elf.display()));
     }
+    tock_check_artifact(&elf)?;
     println!("[xtask] tock-build 完成：{}", elf.display());
+    Ok(())
+}
+
+/// Tock 镜像的产物级安全/布局自检（不依赖硬件）。
+///
+/// 检查 FCB/IVT、向量表初始 SP、栈/DTCM 边界与 `.xip`/`.fcb` 落点；
+/// 任何一项不符都直接失败，避免把"能编译但启动语义错"的镜像烧进去。
+fn tock_check_artifact(elf: &Path) -> Result<(), String> {
+    let data = fs::read(elf).map_err(|error| format!("读 Tock ELF 失败：{error}"))?;
+    let object = object::File::parse(&*data).map_err(|error| format!("解析 Tock ELF 失败：{error}"))?;
+    let section = |name: &str| -> Result<(u64, u64, Vec<u8>), String> {
+        let section = object
+            .section_by_name(name)
+            .ok_or_else(|| format!("Tock ELF 缺少段 {name}"))?;
+        Ok((
+            section.address(),
+            section.size(),
+            section.data().map(|data| data.to_vec()).unwrap_or_default(),
+        ))
+    };
+
+    let (boot_addr, boot_size, boot_data) = section(".boot_hdr")?;
+    if boot_addr != 0x6000_0000 || boot_size != 0x2000 {
+        return Err(format!(
+            ".boot_hdr 位置错误：addr={boot_addr:#x} size={boot_size:#x}（期望 0x60000000/0x2000）"
+        ));
+    }
+    if boot_data.get(..4) != Some(b"FCFB") {
+        return Err(".boot_hdr 开头不是 FCFB（Boot ROM 不会启动）".to_string());
+    }
+    let ivt_magic = u32::from_le_bytes(
+        boot_data
+            .get(0x1000..0x1004)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or("读不到 IVT magic")?,
+    );
+    let ivt_entry = u32::from_le_bytes(
+        boot_data
+            .get(0x1004..0x1008)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or("读不到 IVT entry")?,
+    );
+    if ivt_magic != 0x4020_00D1 || ivt_entry != 0x6000_2000 {
+        return Err(format!(
+            "IVT 错误：magic={ivt_magic:#010x} entry={ivt_entry:#010x}"
+        ));
+    }
+
+    let (text_addr, _text_size, text_data) = section(".text")?;
+    if text_addr != 0x6000_2000 {
+        return Err(format!(".text 起始错误：{text_addr:#x}（期望 0x60002000）"));
+    }
+    let (_stack_addr, stack_size, _) = section(".stack")?;
+    if stack_size != 0xC000 {
+        return Err(format!(
+            ".stack 大小错误：{stack_size:#x}（期望 0xC000，与 `stack_size!` 一致）"
+        ));
+    }
+    let (dtcm_addr, dtcm_size, _) = section(".dtcm")?;
+    if dtcm_addr != 0x2000_0000 || dtcm_size > 0x1_0000 {
+        return Err(format!(
+            ".dtcm 越界：addr={dtcm_addr:#x} size={dtcm_size:#x}（DTCM 0x20000000..0x20010000）"
+        ));
+    }
+    for name in [".xip", ".fcb"] {
+        if let Ok((addr, size, _)) = section(name) {
+            let end = addr.saturating_add(size);
+            if addr < 0x6000_0000 || end > 0x6004_0000 {
+                return Err(format!(
+                    "{name} 落在启动/引导分区之外：{addr:#x}..{end:#x}"
+                ));
+            }
+        }
+    }
+    // 向量表 word0 = 初始 SP，必须等于 Tock 栈顶。
+    let initial_sp = u32::from_le_bytes(
+        text_data
+            .get(..4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or("读不到向量表初始 SP")?,
+    ) as u64;
+    let (stack_addr, stack_size2, _) = section(".stack")?;
+    if initial_sp != stack_addr.saturating_add(stack_size2) {
+        return Err(format!(
+            "向量表初始 SP={initial_sp:#x} 不在栈顶（{:#x}）",
+            stack_addr.saturating_add(stack_size2)
+        ));
+    }
+    println!(
+        "[xtask] tock-check 通过：FCB/IVT、向量表 SP、栈 {} KiB、DTCM/段落点",
+        stack_size / 1024
+    );
     Ok(())
 }
 
@@ -3962,6 +4055,20 @@ fn tock_verify() -> Result<(), String> {
         println!("\n---- 原始串口输出 ----\n{text}\n----------------------");
         return Err(format!("Tock 验证失败：{}", failed.join("、")));
     }
+    // 稳定性观察：再跑 8 s，要求心跳持续且没有 RX 错误/异常中断。
+    let watch = strip_ansi(&capture_raw_until(&mut *port, Instant::now() + Duration::from_secs(8))?);
+    let beats = watch.matches("tock: beat").count();
+    let bad_irq = regex::Regex::new(r"irq_bad=(\d+)").map_err(|error| error.to_string())?;
+    let bad = bad_irq
+        .captures_iter(&watch)
+        .any(|captures| captures[1].parse::<u64>().unwrap_or(0) != 0);
+    if beats < 6 {
+        return Err(format!("稳定性观察失败：8 s 内只看到 {beats} 条心跳"));
+    }
+    if watch.contains("rxerr=") || bad {
+        return Err("稳定性观察失败：出现 RX 错误或未预期中断".to_string());
+    }
+    println!("[xtask] 稳定性观察通过：8 s 心跳 {beats} 条，无 RX 错误/异常中断");
     println!("[xtask] tock-verify 通过：Tock 内核启动 + 中断驱动行回显");
     Ok(())
 }

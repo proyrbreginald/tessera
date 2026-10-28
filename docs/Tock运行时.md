@@ -2,8 +2,10 @@
 
 > **Tock 是后续固定运行时（已确定采用，不再选型/不会替换）**，源码在顶层 `tock/`。
 > 当前生产固件仍是 RTIC；迁移按 [Tock 迁移计划](Tock迁移计划.md) 推进。
-> **Phase 1 已完成**：Tock 入口已复用现有 `board-support`（控制台/PIT/SDRAM/FlexSPI），
-> 真机启动、行回显与 1 Hz 心跳（时基漂移 ±0.03%）通过；终端/FS/日志仍属 Phase 3。
+> **Phase 1 已完成并加固**：Tock 入口已复用现有 `board-support`（控制台/PIT/SDRAM/FlexSPI）；
+> 真机启动、行回显、1 Hz 心跳（漂移 ±0.03%）通过；启动自检（FCB/IVT/向量表/栈/MPU/cache）、
+> 栈高水位、panic 自动复位、未预期中断计数、产物安全门禁（`tock-build` 内）均已落地。
+> 终端/FS/日志仍属 Phase 3。
 
 ## 1. 目录
 
